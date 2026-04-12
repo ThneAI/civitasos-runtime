@@ -1,0 +1,29 @@
+[project]
+name = "civitas-runtime"
+version = "0.1.0"
+description = "CivitasOS Agent Runtime — cognitive loop, conscience, and energy management distilled from CivitasOS social mechanisms"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "ThneAI"}]
+
+dependencies = [
+    "civitasos>=0.1.0",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.20"]
+litellm = ["litellm>=1.0"]
+all = [
+    "openai>=1.0",
+    "anthropic>=0.20",
+    "litellm>=1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["civitas_runtime*"]
