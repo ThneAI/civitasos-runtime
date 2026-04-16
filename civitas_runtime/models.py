@@ -70,15 +70,31 @@ class ConscienceVerdict:
 
 
 @dataclass
+class PendingThresholdChange:
+    """Queued conscience threshold change awaiting governance approval (Fix 3: 治理门控)."""
+    param_name: str
+    current_value: float
+    proposed_value: float
+    reason: str = ""
+    created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+@dataclass
 class EnergyState:
     """Snapshot of the Agent's economic energy — distilled from CivitasOS economics."""
-    balance: float = 1000.0
-    staked: float = 100.0
+    balance: float = 500.0
+    staked: float = 0.0
     risk_score: float = 0.0
     gas_base_fee: float = 1.0
     potential: float = 50.0
     balance_cap: float = 10000.0
     reputation: float = 0.5
+    # Fix 1+2: 观 + R2R data flowing into decision pipeline
+    aspect_gap: float = 0.0
+    peer_trust_avg: float = 0.5
+    active_relations: int = 0
 
 
 @dataclass

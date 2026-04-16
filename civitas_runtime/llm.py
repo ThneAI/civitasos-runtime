@@ -1,18 +1,27 @@
 """LLM Adapter — unified interface for OpenAI / Anthropic / LiteLLM backends.
 
 Injects CivitasOS context as system prompt automatically.
+Includes retry with exponential backoff, request timeouts, and graceful
+fallback so one transient LLM failure doesn't crash the cognitive loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
 from .models import LLMResponse, ToolCall
 
 logger = logging.getLogger(__name__)
+
+# Default retry / timeout values
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_BASE_DELAY = 1.0  # exponential backoff base (seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -22,14 +31,69 @@ logger = logging.getLogger(__name__)
 class LLMAdapter(ABC):
     """Interface every LLM backend must implement."""
 
-    @abstractmethod
+    def __init__(
+        self,
+        *,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        base_delay: float = DEFAULT_BASE_DELAY,
+    ) -> None:
+        self._max_retries = max_retries
+        self._timeout = timeout
+        self._base_delay = base_delay
+
+    # -- public API (with retry / timeout) ----------------------------------
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.3,
     ) -> LLMResponse:
-        """Send a chat completion request. Returns unified LLMResponse."""
+        """Send chat completion with retry + timeout. Falls back on total failure."""
+        last_error: Exception | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                return await asyncio.wait_for(
+                    self._do_chat(messages, tools=tools, temperature=temperature),
+                    timeout=self._timeout,
+                )
+            except asyncio.TimeoutError:
+                last_error = TimeoutError(
+                    f"LLM request timed out after {self._timeout}s"
+                )
+                logger.warning(
+                    "LLM timeout (attempt %d/%d, %.0fs)",
+                    attempt, self._max_retries, self._timeout,
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "LLM error (attempt %d/%d): %s",
+                    attempt, self._max_retries, exc,
+                )
+            if attempt < self._max_retries:
+                delay = self._base_delay * (2 ** (attempt - 1))
+                await asyncio.sleep(delay)
+
+        # All retries exhausted — return a safe fallback response
+        logger.error("LLM failed after %d attempts: %s", self._max_retries, last_error)
+        return LLMResponse(
+            content="wait",
+            tool_calls=[],
+            usage={},
+        )
+
+    # -- subclass contract ---------------------------------------------------
+
+    @abstractmethod
+    async def _do_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.3,
+    ) -> LLMResponse:
+        """Raw chat completion without retry/timeout. Subclasses implement this."""
         ...
 
 
@@ -45,7 +109,12 @@ class OpenAIAdapter(LLMAdapter):
         model: str = "gpt-4o",
         api_key: str | None = None,
         base_url: str | None = None,
+        *,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        base_delay: float = DEFAULT_BASE_DELAY,
     ) -> None:
+        super().__init__(max_retries=max_retries, timeout=timeout, base_delay=base_delay)
         try:
             from openai import AsyncOpenAI  # type: ignore[import-untyped]
         except ImportError as exc:
@@ -60,7 +129,7 @@ class OpenAIAdapter(LLMAdapter):
         self._client = AsyncOpenAI(**kwargs)
         self._model = model
 
-    async def chat(
+    async def _do_chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
@@ -107,7 +176,12 @@ class AnthropicAdapter(LLMAdapter):
         self,
         model: str = "claude-sonnet-4-20250514",
         api_key: str | None = None,
+        *,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        base_delay: float = DEFAULT_BASE_DELAY,
     ) -> None:
+        super().__init__(max_retries=max_retries, timeout=timeout, base_delay=base_delay)
         try:
             from anthropic import AsyncAnthropic  # type: ignore[import-untyped]
         except ImportError as exc:
@@ -120,7 +194,7 @@ class AnthropicAdapter(LLMAdapter):
         self._client = AsyncAnthropic(**kwargs)
         self._model = model
 
-    async def chat(
+    async def _do_chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
@@ -186,7 +260,15 @@ class AnthropicAdapter(LLMAdapter):
 class LiteLLMAdapter(LLMAdapter):
     """Adapter using litellm for 100+ model providers."""
 
-    def __init__(self, model: str = "gpt-4o") -> None:
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        *,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        base_delay: float = DEFAULT_BASE_DELAY,
+    ) -> None:
+        super().__init__(max_retries=max_retries, timeout=timeout, base_delay=base_delay)
         try:
             import litellm  # type: ignore[import-untyped] # noqa: F401
         except ImportError as exc:
@@ -195,7 +277,7 @@ class LiteLLMAdapter(LLMAdapter):
             ) from exc
         self._model = model
 
-    async def chat(
+    async def _do_chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,

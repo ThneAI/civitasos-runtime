@@ -15,6 +15,7 @@ from typing import Any
 from .conscience import Conscience
 from .energy import Energy
 from .llm import LLMAdapter
+from .memory import HybridMemory
 from .models import (
     Decision,
     DecisionSource,
@@ -27,6 +28,19 @@ from .rules import RulesEngine
 from .tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _is_empty_output(output: Any) -> bool:
+    """Check whether a task output is empty (defenses against empty delivery attack)."""
+    if output is None:
+        return True
+    if isinstance(output, str) and not output.strip():
+        return True
+    if isinstance(output, dict) and len(output) == 0:
+        return True
+    if isinstance(output, list) and len(output) == 0:
+        return True
+    return False
 
 # Interval seconds per mode
 _INTERVALS: dict[LoopMode, float] = {
@@ -94,6 +108,7 @@ class CognitiveLoop:
         tools: ToolRegistry | None = None,
         agent_name: str = "",
         capabilities: list[str] | None = None,
+        memory: HybridMemory | None = None,
     ) -> None:
         self._agent = agent
         self._llm = llm
@@ -103,8 +118,10 @@ class CognitiveLoop:
         self._tools = tools or ToolRegistry(agent)
         self._name = agent_name
         self._capabilities = capabilities or []
+        self._memory = memory
         self._mode = LoopMode.IDLE
         self._tick_count = 0
+        self._wake_event: asyncio.Event | None = None
 
         # Callbacks
         self._on_reflect_fns: list[Any] = []
@@ -134,6 +151,19 @@ class CognitiveLoop:
         )
 
         try:
+            # 0. 呼吸税 — breathing costs energy just to exist
+            breath_cost = self._energy.debit_breathing(self._mode.value)
+            if breath_cost > 0:
+                logger.debug("Breathing tax: %.3f CIV (mode=%s)", breath_cost, self._mode.value)
+
+            # Bankruptcy check — if bankrupt, skip all phases
+            if self._energy.is_bankrupt:
+                logger.warning("Agent is BANKRUPT (balance=0, staked=0) — signaling shutdown")
+                ctx.decision = Decision(action="wait", reasoning="bankrupt — shutting down")
+                ctx.phase = TickPhase.REMEMBER
+                await self._remember_tick(ctx)
+                return ctx
+
             # 1. Perceive
             ctx.phase = TickPhase.PERCEIVE
             ctx.briefing = await self._perceive()
@@ -168,6 +198,9 @@ class CognitiveLoop:
                         "active_task_count": len(
                             ctx.briefing.get("active_tasks", [])
                         ),
+                        # Fix 1+2: 观 + R2R flow into conscience
+                        "aspect_gap": self._energy.state.aspect_gap,
+                        "peer_trusts": ctx.briefing.get("_peer_trusts", {}),
                     },
                 )
                 ctx.conscience_verdict = verdict
@@ -212,8 +245,21 @@ class CognitiveLoop:
                 )
                 logger.error("Act failed: %s", exc)
 
-            # 6. Evaluate (already in ctx.evaluation)
+            # 6. Evaluate — validate output quality (防止空交付攻击)
             ctx.phase = TickPhase.EVALUATE
+            if ctx.evaluation and ctx.evaluation.success and ctx.evaluation.outcome is not None:
+                if _is_empty_output(ctx.evaluation.outcome):
+                    logger.warning(
+                        "Empty output detected for action %s — marking as failed",
+                        ctx.decision.action if ctx.decision else "unknown",
+                    )
+                    ctx.evaluation = Evaluation(
+                        success=False,
+                        error="empty output — refusing to confirm delivery",
+                        outcome=ctx.evaluation.outcome,
+                        cost=ctx.evaluation.cost,
+                        duration_ms=ctx.evaluation.duration_ms,
+                    )
 
             # 7. Reflect
             ctx.phase = TickPhase.REFLECT
@@ -247,29 +293,84 @@ class CognitiveLoop:
 
         # Update energy from economics
         self._energy.refresh(briefing.get("economics", {}))
+
+        # Fix 1: 观 → 决策管线 — fetch aspect gap
+        try:
+            aid = getattr(self._agent, "agent_id", None) or ""
+            aspect = self._agent.r2r_aspect_gap(aid)
+            if aspect:
+                briefing.setdefault("aspect", aspect)
+                self._energy.state.aspect_gap = float(
+                    aspect.get("aspect_gap", 0.0)
+                )
+        except Exception:
+            logger.debug("r2r_aspect_gap not available")
+
+        # Fix 2: R2R → 决策管线 — fetch peer trust data
+        try:
+            if hasattr(self._agent, "r2r_flow_health"):
+                flow = self._agent.r2r_flow_health()
+                if flow and isinstance(flow, dict):
+                    briefing.setdefault("flow_health", flow)
+                    relations = flow.get("relations", [])
+                    if relations:
+                        trusts = [
+                            r.get("trust_score", 0.5)
+                            for r in relations
+                            if isinstance(r, dict)
+                        ]
+                        if trusts:
+                            avg = sum(trusts) / len(trusts)
+                            self._energy.state.peer_trust_avg = avg
+                            self._energy.state.active_relations = len(trusts)
+                            briefing["_peer_trusts"] = {
+                                r.get("peer_id", ""): r.get("trust_score", 0.5)
+                                for r in relations
+                                if isinstance(r, dict) and r.get("peer_id")
+                            }
+        except Exception:
+            logger.debug("R2R flow health not available")
+
         return briefing
 
     async def _recall(self, briefing: dict[str, Any]) -> dict[str, Any]:
-        """Retrieve relevant memories."""
+        """Retrieve relevant memories (HybridMemory → local-first, remote-fallback)."""
+        mem = self._memory
         memories: dict[str, Any] = {}
+
+        def _get(key: str) -> Any | None:
+            if mem is not None:
+                return mem.recall(key)
+            try:
+                return self._agent.recall(key)
+            except Exception:
+                return None
+
+        plan = _get("current_plan")
+        if plan:
+            memories["current_plan"] = plan
+        lessons = _get("lessons_learned")
+        if lessons:
+            memories["lessons_learned"] = lessons
+        last_tick = _get("last_tick_summary")
+        if last_tick:
+            memories["last_tick"] = last_tick
+
+        # Semantic recall: find similar episodes based on current context
         try:
-            plan = self._agent.recall("current_plan")
-            if plan:
-                memories["current_plan"] = plan
+            context_query = ", ".join(
+                t.get("description", t.get("task_id", ""))
+                for t in briefing.get("active_tasks", [])
+            ) or ", ".join(self._capabilities) or self._name
+            if mem is not None:
+                similar = mem.recall_similar(context_query, top_k=3)
+            else:
+                similar = self._agent.recall_similar(context_query, top_k=3)
+            if similar:
+                memories["similar_episodes"] = similar
         except Exception:
-            pass
-        try:
-            lessons = self._agent.recall("lessons_learned")
-            if lessons:
-                memories["lessons_learned"] = lessons
-        except Exception:
-            pass
-        try:
-            last_tick = self._agent.recall("last_tick_summary")
-            if last_tick:
-                memories["last_tick"] = last_tick
-        except Exception:
-            pass
+            logger.debug("recall_similar not available or failed")
+
         return memories
 
     async def _decide(
@@ -306,9 +407,32 @@ class CognitiveLoop:
             active_task_count=len(briefing.get("active_tasks", [])),
         )
 
+        # Fix 1: 观 — inject aspect gap into LLM awareness
+        if energy.aspect_gap > 0.5:
+            system += (
+                f"\n\n⚠ 三态警告 · 观:\n"
+                f"Aspect Gap = {energy.aspect_gap:.2f}。"
+                f"自我认知与社会评价严重偏离。\n"
+                f"你的判断可能不准确，优先选择低风险行动，通过合作重建信任。"
+            )
+        elif energy.aspect_gap > 0.2:
+            system += (
+                f"\n\n△ Aspect Gap = {energy.aspect_gap:.2f} — "
+                f"留意自我认知偏差，适当参考他人反馈。"
+            )
+
+        # Fix 2: R2R — inject relationship context into LLM awareness
+        if energy.active_relations > 0:
+            system += (
+                f"\n\n关系状态 · 流:\n"
+                f"活跃关系: {energy.active_relations}, "
+                f"平均信任: {energy.peer_trust_avg:.2f}。\n"
+                f"优先与高信任 Agent 协作，警惕低信任交互。"
+            )
+
         user_content = (
-            f"当前简报:\n{json.dumps(briefing, indent=2, ensure_ascii=False)}\n\n"
-            f"记忆上下文:\n{json.dumps(memories, indent=2, ensure_ascii=False)}\n\n"
+            f"当前简报:\n{json.dumps(briefing, indent=2, ensure_ascii=False, default=str)}\n\n"
+            f"记忆上下文:\n{json.dumps(memories, indent=2, ensure_ascii=False, default=str)}\n\n"
             "请分析当前状态，决定下一步行动。调用合适的工具，或回复 \"wait\"。"
         )
 
@@ -357,7 +481,7 @@ class CognitiveLoop:
         )
 
     def _reflect(self, ctx: TickContext) -> str:
-        """Generate reflection text from evaluation results."""
+        """Generate reflection text from evaluation results + aspect gap."""
         if ctx.evaluation is None:
             return "No evaluation available."
 
@@ -365,28 +489,56 @@ class CognitiveLoop:
         assert decision is not None
 
         if ctx.evaluation.success:
-            return (
+            base = (
                 f"✓ {decision.action} succeeded. "
                 f"Cost {ctx.evaluation.cost:.2f} CIV in {ctx.evaluation.duration_ms}ms."
             )
         else:
-            return (
+            base = (
                 f"✗ {decision.action} failed: {ctx.evaluation.error}. "
                 f"Lesson: avoid this pattern when conditions are similar."
             )
 
+        # Aspect Gap: SelfView vs SocialView divergence
+        try:
+            aid = getattr(self._agent, "agent_id", None) or ""
+            aspect = self._agent.r2r_aspect_gap(aid)
+            if aspect:
+                gap = aspect.get("aspect_gap", 0.0)
+                if gap > 0.3:
+                    base += (
+                        f" ⚠ Aspect gap={gap:.2f} (self_confidence="
+                        f"{aspect.get('self_confidence', '?')}, "
+                        f"social_reputation={aspect.get('social_reputation', '?')}). "
+                        f"Self-perception diverges from social evaluation — "
+                        f"recalibrate strategy."
+                    )
+                elif gap > 0.1:
+                    base += f" △ Aspect gap={gap:.2f} — minor divergence."
+        except Exception:
+            pass  # r2r_aspect_gap not available
+
+        return base
+
     async def _remember_tick(self, ctx: TickContext) -> None:
-        """Persist tick summary to memory."""
+        """Persist tick summary to memory (HybridMemory when available)."""
         summary = {
             "tick_id": ctx.tick_id,
             "action": ctx.decision.action if ctx.decision else "none",
             "success": ctx.evaluation.success if ctx.evaluation else None,
             "reflection": ctx.reflection,
         }
-        try:
-            self._agent.remember("last_tick_summary", summary)
-        except Exception:
-            logger.debug("Failed to save tick summary")
+
+        def _save(key: str, value: Any) -> None:
+            if self._memory is not None:
+                self._memory.remember(key, value)
+            else:
+                try:
+                    self._agent.remember(key, value)
+                except Exception:
+                    logger.debug("Failed to save %s", key)
+
+        _save("last_tick_summary", summary)
 
         # Log episode for long-term memory
         if ctx.decision and ctx.decision.action != "wait":
@@ -402,22 +554,42 @@ class CognitiveLoop:
 
         # Accumulate lessons from failures
         if ctx.evaluation and not ctx.evaluation.success and ctx.reflection:
-            try:
-                lessons = self._agent.recall("lessons_learned") or []
-                if isinstance(lessons, list):
-                    lessons.append({
-                        "tick": ctx.tick_id,
-                        "action": ctx.decision.action if ctx.decision else "",
-                        "lesson": ctx.reflection,
-                    })
-                    # Keep last 20 lessons
-                    lessons = lessons[-20:]
-                    self._agent.remember("lessons_learned", lessons)
-            except Exception:
-                pass
+            if self._memory is not None:
+                lessons = self._memory.recall("lessons_learned") or []
+            else:
+                try:
+                    lessons = self._agent.recall("lessons_learned") or []
+                except Exception:
+                    lessons = []
+            if isinstance(lessons, list):
+                lessons.append({
+                    "tick": ctx.tick_id,
+                    "action": ctx.decision.action if ctx.decision else "",
+                    "lesson": ctx.reflection,
+                })
+                lessons = lessons[-20:]
+                _save("lessons_learned", lessons)
 
     def _update_mode(self, briefing: dict[str, Any]) -> None:
-        """Auto-adjust loop mode based on briefing signals."""
+        """Auto-adjust loop mode based on briefing signals and economic state.
+
+        EVENT mode is set externally via wake() and decays to ACTIVE after
+        one tick so the agent re-evaluates normally.
+
+        Economic pressure:
+        - balance < 5 → force SLEEPING (conserve energy)
+        - balance == 0 → SLEEPING (bankruptcy loop in runner will handle shutdown)
+        """
+        if self._mode == LoopMode.EVENT:
+            # EVENT tick consumed — fall through to standard scheduling
+            self._mode = LoopMode.ACTIVE
+            return
+
+        # 经济压力: 余额不足时强制休眠以降低呼吸税消耗
+        if self._energy.state.balance < 5.0:
+            self._mode = LoopMode.SLEEPING
+            return
+
         if briefing.get("urgency") or briefing.get("active_tasks"):
             self._mode = LoopMode.ACTIVE
         elif briefing.get("opportunities"):
@@ -431,3 +603,18 @@ class CognitiveLoop:
         """Register a callback invoked after each Reflect phase."""
         self._on_reflect_fns.append(fn)
         return fn
+
+    def wake(self, reason: str = "external") -> None:
+        """Switch to EVENT mode and trigger an immediate tick.
+
+        Called by the gateway or external webhook to wake a sleeping agent.
+        """
+        prev = self._mode
+        self._mode = LoopMode.EVENT
+        logger.info("WAKE(%s): %s → EVENT", reason, prev.value)
+        if self._wake_event is not None:
+            self._wake_event.set()
+
+    def bind_wake_event(self, event: asyncio.Event) -> None:
+        """Bind an asyncio.Event so ``wake()`` can interrupt sleep."""
+        self._wake_event = event

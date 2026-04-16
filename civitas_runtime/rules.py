@@ -71,6 +71,8 @@ class RulesEngine:
         ) -> Decision | None:
             """Complete tasks about to expire (< 120s remaining)."""
             for u in briefing.get("urgency", []):
+                if not isinstance(u, dict):
+                    continue
                 remaining = u.get("remaining_secs", 9999)
                 task_id = u.get("task_id")
                 if remaining < 120 and task_id:
@@ -92,6 +94,8 @@ class RulesEngine:
         ) -> Decision | None:
             """Wait if risk score is dangerously high."""
             for w in briefing.get("warnings", []):
+                if not isinstance(w, dict):
+                    continue
                 if w.get("type") == "high_risk_score":
                     return Decision(
                         action="wait",

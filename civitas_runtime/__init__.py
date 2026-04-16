@@ -17,6 +17,7 @@ For embedding mode (single tick):
 
 from .conscience import Conscience
 from .energy import Energy
+from .gateway import CallRecord, CivitasGateway, GatewayConfig, Ledger
 from .llm import (
     AnthropicAdapter,
     LiteLLMAdapter,
@@ -25,6 +26,7 @@ from .llm import (
     create_llm,
 )
 from .loop import CognitiveLoop
+from .memory import HybridMemory, LocalMemory
 from .models import (
     ConscienceVerdict,
     Decision,
@@ -33,6 +35,7 @@ from .models import (
     Evaluation,
     LLMResponse,
     LoopMode,
+    PendingThresholdChange,
     TickContext,
     TickPhase,
     ToolCall,
@@ -47,12 +50,20 @@ __version__ = "0.1.0"
 __all__ = [
     # Main entry point
     "AgentRunner",
+    # Gateway
+    "CivitasGateway",
+    "GatewayConfig",
+    "CallRecord",
+    "Ledger",
     # Core modules
     "CognitiveLoop",
     "Conscience",
     "Energy",
     "RulesEngine",
     "ToolRegistry",
+    # Memory
+    "HybridMemory",
+    "LocalMemory",
     # LLM
     "LLMAdapter",
     "OpenAIAdapter",
@@ -66,6 +77,7 @@ __all__ = [
     "Evaluation",
     "ConscienceVerdict",
     "EnergyState",
+    "PendingThresholdChange",
     "LoopMode",
     "TickPhase",
     "ToolDef",

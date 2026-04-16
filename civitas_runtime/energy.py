@@ -46,6 +46,14 @@ _DEFAULT_GAS: dict[str, float] = {
     "economics_unstake": 1.0,
 }
 
+# 呼吸税: breathing cost per tick by loop mode
+BREATHING_COST: dict[str, float] = {
+    "ACTIVE": 0.1,
+    "IDLE": 0.05,
+    "SLEEPING": 0.01,
+    "EVENT": 0.1,
+}
+
 
 class Energy:
     """Track and constrain the Agent's energy budget.
@@ -115,3 +123,14 @@ class Energy:
     def overflow_warning(self) -> bool:
         """True when balance approaches cap (众生之果: overflow → circulation)."""
         return self._state.balance > self._state.balance_cap * 0.9
+
+    @property
+    def is_bankrupt(self) -> bool:
+        """True when balance AND staked are both 0 — Agent is dead."""
+        return self._state.balance <= 0 and self._state.staked <= 0
+
+    def debit_breathing(self, mode: str) -> float:
+        """Deduct breathing tax for current tick. Returns cost paid."""
+        cost = BREATHING_COST.get(mode, 0.01)
+        self._state.balance = max(0.0, self._state.balance - cost)
+        return cost

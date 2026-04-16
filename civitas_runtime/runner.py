@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from typing import Any, Callable
 
 from .conscience import Conscience
 from .energy import Energy
+from .gateway import CivitasGateway, GatewayConfig
 from .llm import LLMAdapter, create_llm
 from .loop import CognitiveLoop
+from .memory import HybridMemory
 from .models import ConscienceVerdict, Decision, EnergyState, TickContext
 from .rules import RulesEngine, RuleFn
 from .tools import ToolRegistry
@@ -47,6 +50,11 @@ class AgentRunner:
         heartbeat_interval: int = 60,
         llm_kwargs: dict[str, Any] | None = None,
         conscience_config: dict[str, Any] | None = None,
+        gateway_port: int | None = None,
+        gateway_config: GatewayConfig | None = None,
+        identity_file: str | None = None,
+        endpoint_url: str | None = None,
+        data_dir: str | None = None,
     ) -> None:
         self._base_url = base_url
         self._name = name
@@ -55,11 +63,24 @@ class AgentRunner:
         self._heartbeat_interval = heartbeat_interval
         self._csp = cognitive_provider
         self._shutting_down = False
+        self._identity_file = identity_file
+        self._endpoint_url = endpoint_url
+        self._data_dir = data_dir or "data"
+
+        # Gateway config
+        if gateway_port is not None:
+            self._gateway_config = gateway_config or GatewayConfig(port=gateway_port)
+        elif gateway_config is not None:
+            self._gateway_config = gateway_config
+        else:
+            self._gateway_config = None
+        self._gateway: CivitasGateway | None = None
 
         # Lazy init — set up in start()
         self._agent: Any = None
         self._loop: CognitiveLoop | None = None
         self._tools: ToolRegistry | None = None
+        self._memory: HybridMemory | None = None
         self._rules = RulesEngine()
         self._conscience = Conscience(**(conscience_config or {}))
         self._energy = Energy()
@@ -116,16 +137,26 @@ class AgentRunner:
         # 1. Create SDK agent
         self._agent = self._create_agent()
 
-        # 2. Generate keys + register
-        self._agent.generate_keys()
+        # 2. Identity: load existing or generate new keys
+        if self._identity_file and os.path.exists(self._identity_file):
+            self._agent.load_identity(self._identity_file)
+            logger.info("Identity loaded from %s", self._identity_file)
+        else:
+            self._agent.generate_keys()
+            if self._identity_file:
+                self._agent.save_identity(self._identity_file)
+                logger.info("New identity saved to %s", self._identity_file)
         await self._register()
 
-        # 3. Build tool registry
+        # 3. Build persistent memory (local + remote)
+        self._memory = HybridMemory(self._agent, data_dir=self._data_dir)
+
+        # 4. Build tool registry
         self._tools = ToolRegistry(self._agent)
         for tool_name, fn, kwargs in self._custom_tools:
             self._tools.register(tool_name, fn, **kwargs)
 
-        # 4. Build cognitive loop
+        # 5. Build cognitive loop
         self._loop = CognitiveLoop(
             self._agent,
             llm=self._llm,
@@ -135,19 +166,35 @@ class AgentRunner:
             tools=self._tools,
             agent_name=self._name,
             capabilities=self._capabilities,
+            memory=self._memory,
         )
 
         # Forward on_reflect if registered
         if hasattr(self, "_on_reflect_fn"):
             self._loop.on_reflect(self._on_reflect_fn)
 
-        # 5. Install signal handlers for graceful shutdown
+        # 6. Install signal handlers for graceful shutdown
         for sig in (signal.SIGINT, signal.SIGTERM):
             asyncio.get_event_loop().add_signal_handler(
                 sig, lambda: asyncio.ensure_future(self.stop())
             )
 
-        # 6. Start heartbeat + cognitive loop
+        # 7. Optionally start the gateway
+        if self._gateway_config:
+            self._gateway = CivitasGateway(
+                self._agent,
+                self._tools,
+                self._conscience,
+                self._energy,
+                llm=self._llm,
+                config=self._gateway_config,
+                agent_name=self._name,
+                capabilities=self._capabilities,
+            )
+            await self._gateway.start()
+            logger.info("Gateway started on port %d", self._gateway_config.port)
+
+        # 8. Start heartbeat + cognitive loop
         logger.info("Agent %s registered, starting cognitive loop", self._name)
         await asyncio.gather(
             self._heartbeat_loop(),
@@ -161,10 +208,30 @@ class AgentRunner:
         self._shutting_down = True
         logger.info("AgentRunner shutting down: %s", self._name)
 
-        # Save shutdown state
+        # Stop gateway
+        if self._gateway:
+            await self._gateway.stop()
+
+        # Attempt to release/complete active tasks before exiting
         if self._agent:
             try:
-                self._agent.remember("shutdown_state", {
+                briefing = self._agent.briefing()
+                for task in briefing.get("active_tasks", []):
+                    task_id = task.get("task_id")
+                    if not task_id:
+                        continue
+                    try:
+                        self._agent.pool_abandon(task_id=task_id)
+                        logger.info("Abandoned task %s on shutdown", task_id)
+                    except Exception:
+                        logger.debug("Failed to abandon task %s", task_id)
+            except Exception:
+                logger.debug("Could not retrieve active tasks on shutdown")
+
+        # Save shutdown state
+        if self._memory:
+            try:
+                self._memory.remember("shutdown_state", {
                     "tick_count": self._loop.tick_count if self._loop else 0,
                     "mode": self._loop.mode.value if self._loop else "unknown",
                     "clean_shutdown": True,
@@ -172,11 +239,19 @@ class AgentRunner:
             except Exception:
                 pass
 
+        # Close local memory DB
+        if self._memory:
+            self._memory.close()
+
     # -- Internal loops ------------------------------------------------------
 
     async def _cognitive_loop(self) -> None:
         """Main loop: tick → sleep → repeat."""
         assert self._loop is not None
+
+        # Set up wake event so external signals can interrupt sleep
+        wake_event = asyncio.Event()
+        self._loop.bind_wake_event(wake_event)
 
         # Check for crash recovery
         await self._recover()
@@ -194,10 +269,24 @@ class AgentRunner:
             except Exception:
                 logger.exception("Cognitive loop tick failed")
 
-            # Sleep based on current mode
+            # 呼吸税 — 破产检测: balance=0 且 staked=0 → Agent 死亡
+            if self._energy.is_bankrupt:
+                logger.warning(
+                    "BANKRUPT: Agent %s has no balance and no stake. Initiating death.",
+                    self._name,
+                )
+                await self.stop()
+                break
+
+            # Sleep based on current mode; wake_event can interrupt early
             interval = self._loop.interval
             if interval > 0 and not self._shutting_down:
-                await asyncio.sleep(interval)
+                wake_event.clear()
+                try:
+                    await asyncio.wait_for(wake_event.wait(), timeout=interval)
+                    logger.debug("Sleep interrupted by wake event")
+                except asyncio.TimeoutError:
+                    pass  # Normal timeout — proceed to next tick
 
         logger.info("Cognitive loop exited after %d ticks", self._loop.tick_count)
 
@@ -213,10 +302,10 @@ class AgentRunner:
 
     async def _recover(self) -> None:
         """Check for crash recovery state from previous run."""
-        if not self._agent:
+        if not self._memory:
             return
         try:
-            state = self._agent.recall("shutdown_state")
+            state = self._memory.recall("shutdown_state")
             if state and not state.get("clean_shutdown"):
                 logger.warning(
                     "Recovering from unclean shutdown (last tick_count=%s)",
@@ -237,13 +326,20 @@ class AgentRunner:
 
     async def _register(self) -> None:
         """Register the agent on the CivitasOS network."""
+        # Resolve endpoint URL for external callback
+        endpoint = self._endpoint_url or ""
+        if not endpoint and self._gateway_config:
+            host = os.getenv("AGENT_HOSTNAME", "localhost")
+            port = self._gateway_config.port
+            endpoint = f"http://{host}:{port}"
+
         try:
             self._agent.a2a_quickstart(
                 name=self._name,
-                endpoint="",
+                endpoint=endpoint,
                 description=f"Autonomous agent: {', '.join(self._capabilities)}",
             )
-            logger.info("Agent registered via a2a_quickstart")
+            logger.info("Agent registered via a2a_quickstart (endpoint=%s)", endpoint)
         except Exception:
             logger.warning("a2a_quickstart failed, trying register()")
             try:

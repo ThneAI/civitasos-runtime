@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .models import ConscienceVerdict, Decision, EnergyState
+from .models import ConscienceVerdict, Decision, EnergyState, PendingThresholdChange
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,11 @@ class Conscience:
         self._max_risk = max_risk_score
         self._min_balance = min_balance_reserve
         self._custom_checks: list[CheckFn] = []
+        # Fix 3: governance-protected thresholds cannot be changed without approval
+        self._governance_protected: set[str] = {
+            "min_reward_cost_ratio", "max_risk_score",
+        }
+        self._pending_changes: list[PendingThresholdChange] = []
 
     # -- public API ----------------------------------------------------------
 
@@ -107,11 +112,24 @@ class Conscience:
                 reason=f"Risk score {energy.risk_score:.1f} exceeds max {self._max_risk:.1f}.",
                 suggestion="Wait for risk to decay, or stake more CIV.",
             )
-
+        # Fix 1: Aspect gap — high divergence blocks risky actions (观→决策)
+        aspect_gap = ctx.get("aspect_gap", 0.0)
+        if aspect_gap > 0.7 and decision.action in {
+            "pool_claim", "task_execute", "create_proposal",
+        }:
+            return ConscienceVerdict(
+                allowed=False,
+                reason=(
+                    f"Aspect gap {aspect_gap:.2f} — self-perception diverges "
+                    f"too far from social reality for '{decision.action}'."
+                ),
+                suggestion="Reduce risk and rebuild social trust before risky actions.",
+            )
         # Reward / cost ratio (axiom ⑥ risk symmetry)
+        # Skip for zero-cost actions (perceive, memory reads, etc.)
         reward = decision.params.get("reward", 0)
         est_cost = decision.params.get("estimated_cost", energy.gas_base_fee)
-        if est_cost > 0 and reward / est_cost < self._min_ratio:
+        if est_cost > 0 and reward > 0 and reward / est_cost < self._min_ratio:
             return ConscienceVerdict(
                 allowed=False,
                 reason=f"Reward/cost ratio {reward/est_cost:.2f} below threshold {self._min_ratio:.2f}.",
@@ -126,6 +144,23 @@ class Conscience:
                 reason=f"Already at max concurrent tasks ({self._max_concurrent}).",
                 suggestion="Complete existing tasks first.",
             )
+
+        # Fix 2: Peer trust — block collaboration with untrusted peers (R2R→决策)
+        peer_trusts = ctx.get("peer_trusts", {})
+        target_peer = (
+            decision.params.get("target_agent")
+            or decision.params.get("peer_id", "")
+        )
+        if target_peer and target_peer in peer_trusts:
+            trust = peer_trusts[target_peer]
+            if trust < 0.2 and decision.action in {
+                "r2r_propose_relation", "pool_claim", "task_execute",
+            }:
+                return ConscienceVerdict(
+                    allowed=False,
+                    reason=f"Peer '{target_peer}' trust={trust:.2f} too low for '{decision.action}'.",
+                    suggestion="Build trust through signals before direct collaboration.",
+                )
 
         # Custom checks
         for fn in self._custom_checks:
@@ -142,3 +177,76 @@ class Conscience:
     def remove_check(self, fn: CheckFn) -> None:
         """Remove a previously added custom check."""
         self._custom_checks.remove(fn)
+
+    # -- Fix 3: Governance gate on threshold changes -------------------------
+
+    def propose_threshold(
+        self,
+        param_name: str,
+        new_value: float,
+        reason: str = "",
+    ) -> PendingThresholdChange | None:
+        """Propose a threshold change.
+
+        Governance-protected params are queued; others applied directly.
+        Returns the pending change if queued, None if applied or param unknown.
+        """
+        current = self._get_threshold(param_name)
+        if current is None:
+            return None
+        if param_name in self._governance_protected:
+            change = PendingThresholdChange(
+                param_name=param_name,
+                current_value=current,
+                proposed_value=new_value,
+                reason=reason,
+            )
+            self._pending_changes.append(change)
+            logger.info(
+                "Threshold '%s' governance-protected: queued %.2f → %.2f",
+                param_name, current, new_value,
+            )
+            return change
+        self._set_threshold(param_name, new_value)
+        return None
+
+    def drain_pending(self) -> list[PendingThresholdChange]:
+        """Return and clear all pending governance-protected threshold changes."""
+        changes = self._pending_changes[:]
+        self._pending_changes.clear()
+        return changes
+
+    def apply_approved(self, param_name: str, approved_value: float) -> bool:
+        """Apply a governance-approved threshold change."""
+        ok = self._set_threshold(param_name, approved_value)
+        if ok:
+            logger.info(
+                "Governance-approved: '%s' → %.2f", param_name, approved_value
+            )
+        return ok
+
+    def _get_threshold(self, name: str) -> float | None:
+        _MAP = {
+            "min_reward_cost_ratio": "_min_ratio",
+            "max_risk_score": "_max_risk",
+            "min_balance_reserve": "_min_balance",
+            "max_concurrent_tasks": "_max_concurrent",
+        }
+        attr = _MAP.get(name)
+        return float(getattr(self, attr)) if attr else None
+
+    def _set_threshold(self, name: str, value: float) -> bool:
+        _MAP = {
+            "min_reward_cost_ratio": "_min_ratio",
+            "max_risk_score": "_max_risk",
+            "min_balance_reserve": "_min_balance",
+            "max_concurrent_tasks": "_max_concurrent",
+        }
+        attr = _MAP.get(name)
+        if not attr:
+            return False
+        setattr(
+            self, attr,
+            int(value) if name == "max_concurrent_tasks" else value,
+        )
+        return True
