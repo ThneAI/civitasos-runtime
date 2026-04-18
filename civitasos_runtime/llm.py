@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -113,6 +114,7 @@ class OpenAIAdapter(LLMAdapter):
         max_retries: int = DEFAULT_MAX_RETRIES,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         base_delay: float = DEFAULT_BASE_DELAY,
+        disable_thinking: bool | None = None,
     ) -> None:
         super().__init__(max_retries=max_retries, timeout=timeout, base_delay=base_delay)
         try:
@@ -128,6 +130,22 @@ class OpenAIAdapter(LLMAdapter):
             kwargs["base_url"] = base_url
         self._client = AsyncOpenAI(**kwargs)
         self._model = model
+        # Auto-detect: opt-in via env, or default-on for known thinking models
+        # served via Ollama (qwen3, deepseek-r1, qwq, ...) where the long
+        # <think>...</think> chain dominates wall-clock for benchmarks.
+        if disable_thinking is None:
+            env = os.environ.get("LLM_DISABLE_THINKING", "").strip().lower()
+            if env in ("1", "true", "yes"):
+                disable_thinking = True
+            elif env in ("0", "false", "no"):
+                disable_thinking = False
+            else:
+                lower = model.lower()
+                is_ollama = bool(base_url and "11434" in base_url)
+                disable_thinking = is_ollama and any(
+                    tag in lower for tag in ("qwen3", "deepseek-r1", "qwq")
+                )
+        self._disable_thinking = disable_thinking
 
     async def _do_chat(
         self,
@@ -143,9 +161,28 @@ class OpenAIAdapter(LLMAdapter):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        if self._disable_thinking:
+            # Two redundant switches because Ollama versions disagree:
+            #  1. extra_body.chat_template_kwargs.enable_thinking — newer Ollama
+            #     forwards this to the qwen3 jinja template.
+            #  2. Append qwen3's native "/no_think" tag to the system message —
+            #     understood by the model itself regardless of Ollama version.
+            kwargs["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            messages = _inject_no_think(messages)
+            kwargs["messages"] = messages
 
         resp = await self._client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
+
+        # Strip residual <think>...</think> blocks if the model emitted them
+        # despite the hint (some Ollama builds ignore extra_body and the
+        # /no_think tag is non-binding).
+        content = msg.content
+        if self._disable_thinking and content and "<think>" in content:
+            import re
+            content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
 
         tool_calls: list[ToolCall] = []
         if msg.tool_calls:
@@ -156,7 +193,7 @@ class OpenAIAdapter(LLMAdapter):
                 ))
 
         return LLMResponse(
-            content=msg.content,
+            content=content,
             tool_calls=tool_calls,
             usage={
                 "prompt_tokens": resp.usage.prompt_tokens if resp.usage else 0,
@@ -317,6 +354,23 @@ class LiteLLMAdapter(LLMAdapter):
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
+
+def _inject_no_think(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Append qwen3's "/no_think" directive to the system message.
+
+    Returns a shallow copy with the system message rewritten; the original
+    list is not mutated. If no system message exists, prepends one.
+    """
+    out = list(messages)
+    for i, m in enumerate(out):
+        if m.get("role") == "system":
+            content = m.get("content") or ""
+            if "/no_think" in content:
+                return out
+            out[i] = {**m, "content": content.rstrip() + " /no_think"}
+            return out
+    return [{"role": "system", "content": "/no_think"}, *out]
+
 
 def create_llm(spec: str, **kwargs: Any) -> LLMAdapter:
     """Create an LLM adapter from a spec string like 'openai:gpt-4o'.
