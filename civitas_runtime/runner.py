@@ -66,6 +66,7 @@ class AgentRunner:
         self._identity_file = identity_file
         self._endpoint_url = endpoint_url
         self._data_dir = data_dir or "data"
+        self._webhook_sub_id: str | None = None
 
         # Gateway config
         if gateway_port is not None:
@@ -191,8 +192,12 @@ class AgentRunner:
                 agent_name=self._name,
                 capabilities=self._capabilities,
             )
+            self._gateway.bind_loop(self._loop)
             await self._gateway.start()
             logger.info("Gateway started on port %d", self._gateway_config.port)
+
+            # 7b. Register webhook so CivitasOS pushes events to /v1/wake
+            await self._register_webhook()
 
         # 8. Start heartbeat + cognitive loop
         logger.info("Agent %s registered, starting cognitive loop", self._name)
@@ -207,6 +212,14 @@ class AgentRunner:
             return
         self._shutting_down = True
         logger.info("AgentRunner shutting down: %s", self._name)
+
+        # Unregister webhook before stopping gateway
+        if self._webhook_sub_id:
+            try:
+                self._agent.webhook_unregister(self._webhook_sub_id)
+                logger.info("Webhook unregistered: %s", self._webhook_sub_id)
+            except Exception:
+                logger.debug("Failed to unregister webhook")
 
         # Stop gateway
         if self._gateway:
@@ -353,6 +366,35 @@ class AgentRunner:
             except Exception:
                 logger.exception("Agent registration failed entirely")
                 raise
+
+    async def _register_webhook(self) -> None:
+        """Register a webhook so CivitasOS pushes task events to our /v1/wake."""
+        if not self._gateway_config:
+            return
+
+        # Build callback URL pointing to our gateway
+        host = os.getenv("AGENT_HOSTNAME", "localhost")
+        port = self._gateway_config.port
+        callback_url = self._endpoint_url or f"http://{host}:{port}"
+        wake_url = f"{callback_url.rstrip('/')}/v1/wake"
+
+        try:
+            result = self._agent.webhook_register(
+                callback_url=wake_url,
+                events=[
+                    "task.posted", "task.claimed", "task.completed",
+                    "task.failed", "task.settled",
+                ],
+            )
+            self._webhook_sub_id = result.get("subscription_id")
+            logger.info(
+                "Webhook registered: %s → %s (events: %s)",
+                self._webhook_sub_id,
+                wake_url,
+                result.get("events"),
+            )
+        except Exception:
+            logger.warning("Failed to register webhook — event-driven wake disabled")
 
     def _create_agent(self) -> Any:
         """Create the CivitasOS SDK agent instance."""

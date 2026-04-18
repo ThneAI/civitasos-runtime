@@ -160,10 +160,15 @@ class CivitasGateway:
         self._ledger = Ledger()
         self._name = agent_name or "CivitasRuntime"
         self._capabilities = capabilities or []
+        self._cognitive_loop: Any = None  # bound via bind_loop()
 
     @property
     def ledger(self) -> Ledger:
         return self._ledger
+
+    def bind_loop(self, loop: Any) -> None:
+        """Bind the CognitiveLoop so /v1/wake can call loop.wake()."""
+        self._cognitive_loop = loop
 
     # -- Server lifecycle ---------------------------------------------------
 
@@ -180,6 +185,7 @@ class CivitasGateway:
         app.router.add_get("/v1/tools", self._handle_list_tools)
         app.router.add_post("/v1/tools/{name}", self._handle_tool_call)
         app.router.add_post("/v1/delegate", self._handle_delegate)
+        app.router.add_post("/v1/wake", self._handle_wake)
         app.router.add_get("/v1/status", self._handle_status)
         app.router.add_get("/v1/ledger", self._handle_ledger)
 
@@ -221,6 +227,40 @@ class CivitasGateway:
             # Fallback: can't verify — allow but log
             logger.debug("Could not query balance for %s", did)
             return float("inf")
+
+    # ======================================================================
+    # WEBHOOK WAKE — event-driven activation
+    # ======================================================================
+
+    async def _handle_wake(self, request: Any) -> Any:
+        """POST /v1/wake — receive webhook from CivitasOS, wake the agent.
+
+        Body (from CivitasOS dispatch_a2a_webhook)::
+
+            {
+                "event": "task.posted",
+                "subscription_id": "a2a-wh-...",
+                "agent_id": "...",
+                "timestamp": "...",
+                "data": { ... }
+            }
+        """
+        from aiohttp import web
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        event_type = body.get("event", "unknown")
+        logger.info("WAKE received: event=%s data_keys=%s", event_type, list(body.get("data", {}).keys()))
+
+        if self._cognitive_loop is not None:
+            self._cognitive_loop.wake(reason=event_type)
+        else:
+            logger.warning("Wake received but no cognitive loop bound")
+
+        return web.json_response({"accepted": True, "event": event_type})
 
     # ======================================================================
     # AUTONOMOUS MODE — fine-grained tool access
