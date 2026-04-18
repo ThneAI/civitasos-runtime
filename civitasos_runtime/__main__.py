@@ -1,12 +1,12 @@
-"""CLI entry point — ``python -m civitas_runtime``.
+"""CLI entry point — ``python -m civitasos_runtime``.
 
 Usage examples::
 
     # Minimal — Ollama local, default node
-    python -m civitas_runtime --name AlphaTrader --llm ollama:qwen3
+    python -m civitasos_runtime --name AlphaTrader --llm ollama:qwen3
 
     # Full options
-    python -m civitas_runtime \
+    python -m civitasos_runtime \
         --name BetaScout \
         --backend http://node1:8099 \
         --llm openai:gpt-4o --llm-api-key sk-... \
@@ -16,7 +16,7 @@ Usage examples::
         --stake 200
 
     # Multiple backend nodes (failover)
-    python -m civitas_runtime \
+    python -m civitasos_runtime \
         --name GammaWorker \
         --backend http://node1:8099,http://node2:8099 \
         --llm anthropic:claude-sonnet-4-20250514
@@ -33,7 +33,7 @@ import sys
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="civitas-runtime",
+        prog="civitasos-runtime",
         description="CivitasOS Agent Runtime — run an autonomous agent.",
     )
 
@@ -174,7 +174,7 @@ def main() -> None:
         data_dir=args.data_dir,
     )
 
-    logger = logging.getLogger("civitas_runtime")
+    logger = logging.getLogger("civitasos_runtime")
     logger.info(
         "Starting %s | backend=%s | llm=%s | gateway=%s",
         args.name,

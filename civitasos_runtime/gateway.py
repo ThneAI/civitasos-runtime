@@ -178,7 +178,7 @@ class CivitasGateway:
             from aiohttp import web
         except ImportError as exc:
             raise ImportError(
-                "Gateway requires aiohttp: pip install 'civitas-runtime[gateway]'"
+                "Gateway requires aiohttp: pip install 'civitasos-runtime[gateway]'"
             ) from exc
 
         app = web.Application()

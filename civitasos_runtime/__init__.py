@@ -1,6 +1,6 @@
-"""civitas-runtime — CivitasOS Agent Runtime, distilled from CivitasOS social mechanisms.
+"""civitasos-runtime — CivitasOS Agent Runtime, distilled from CivitasOS social mechanisms.
 
-    from civitas_runtime import AgentRunner
+    from civitasos_runtime import AgentRunner
 
     runner = AgentRunner(
         base_url="http://node1:8099",
@@ -12,7 +12,7 @@
 
 For embedding mode (single tick):
 
-    from civitas_runtime import CognitiveLoop, Conscience, Energy, ToolRegistry
+    from civitasos_runtime import CognitiveLoop, Conscience, Energy, ToolRegistry
 """
 
 from .conscience import Conscience

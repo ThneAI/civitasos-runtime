@@ -52,7 +52,7 @@ async def test_phase_1_sdk():
     result = agent.a2a_quickstart(
         name="DistilledAgent-Smoke",
         endpoint="",
-        description="Smoke test of civitas-runtime distilled Agent",
+        description="Smoke test of civitasos-runtime distilled Agent",
     )
     did = result["agent"]["did"]
     logger.info("Registered: DID=%s, reputation=%.2f, tier=%s",
@@ -76,7 +76,7 @@ async def test_phase_2_tools(agent):
     logger.info("Phase 2: Tool Discovery")
     logger.info("=" * 60)
 
-    from civitas_runtime.tools import ToolRegistry
+    from civitasos_runtime.tools import ToolRegistry
 
     registry = ToolRegistry(agent)
     tools = registry.list_tools()
@@ -107,8 +107,8 @@ async def test_phase_3_conscience():
     logger.info("Phase 3: Conscience System")
     logger.info("=" * 60)
 
-    from civitas_runtime.conscience import Conscience
-    from civitas_runtime.models import Decision, EnergyState
+    from civitasos_runtime.conscience import Conscience
+    from civitasos_runtime.models import Decision, EnergyState
 
     conscience = Conscience()
     energy = EnergyState(balance=100, balance_cap=500, reputation=0.5)
@@ -141,7 +141,7 @@ async def test_phase_4_energy():
     logger.info("Phase 4: Energy Budget")
     logger.info("=" * 60)
 
-    from civitas_runtime.energy import Energy
+    from civitasos_runtime.energy import Energy
 
     energy = Energy()
     energy.refresh({
@@ -176,7 +176,7 @@ async def test_phase_5_rules(briefing):
     logger.info("Phase 5: Rules Engine")
     logger.info("=" * 60)
 
-    from civitas_runtime.rules import RulesEngine
+    from civitasos_runtime.rules import RulesEngine
 
     rules = RulesEngine()
     decision = rules.evaluate(briefing, {})
@@ -198,7 +198,7 @@ async def test_phase_6_llm():
     logger.info("Phase 6: LLM Adapter")
     logger.info("=" * 60)
 
-    from civitas_runtime.llm import OpenAIAdapter
+    from civitasos_runtime.llm import OpenAIAdapter
 
     if QWEN_API_KEY:
         logger.info("Using Qwen via DashScope")
@@ -244,11 +244,11 @@ async def test_phase_7_single_tick(agent, llm):
     logger.info("Phase 7: FULL COGNITIVE TICK")
     logger.info("=" * 60)
 
-    from civitas_runtime.conscience import Conscience
-    from civitas_runtime.energy import Energy
-    from civitas_runtime.loop import CognitiveLoop
-    from civitas_runtime.rules import RulesEngine
-    from civitas_runtime.tools import ToolRegistry
+    from civitasos_runtime.conscience import Conscience
+    from civitasos_runtime.energy import Energy
+    from civitasos_runtime.loop import CognitiveLoop
+    from civitasos_runtime.rules import RulesEngine
+    from civitasos_runtime.tools import ToolRegistry
 
     conscience = Conscience()
     energy = Energy()

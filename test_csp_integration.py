@@ -125,7 +125,7 @@ def main():
     # ── T2: HybridMemory (Runtime layer) ────────────────────────
     print("\nPhase 2: HybridMemory (local + remote)")
 
-    from civitas_runtime.memory import HybridMemory
+    from civitasos_runtime.memory import HybridMemory
     import tempfile
 
     def t2_hybrid_roundtrip():

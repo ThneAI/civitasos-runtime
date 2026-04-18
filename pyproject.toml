@@ -1,5 +1,5 @@
 [project]
-name = "civitas-runtime"
+name = "civitasos-runtime"
 version = "0.1.0"
 description = "CivitasOS Agent Runtime — cognitive loop, conscience, and energy management distilled from CivitasOS social mechanisms"
 readme = "README.md"
@@ -28,4 +28,4 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["civitas_runtime*"]
+include = ["civitasos_runtime*"]

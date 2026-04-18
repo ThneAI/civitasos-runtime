@@ -1,4 +1,4 @@
-"""Data models for civitas-runtime — distilled from CivitasOS ontology."""
+"""Data models for civitasos-runtime — distilled from CivitasOS ontology."""
 
 from __future__ import annotations
 

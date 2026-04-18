@@ -1,4 +1,4 @@
-"""Tests for the three VMV alignment fixes in civitas-runtime.
+"""Tests for the three VMV alignment fixes in civitasos-runtime.
 
 Fix 1: 观→决策 — Aspect gap flows into conscience + LLM context
 Fix 2: R2R→决策 — Peer trust flows into conscience + LLM context
@@ -6,7 +6,7 @@ Fix 3: 治理门控 — Governance-protected thresholds require approval
 """
 
 import pytest
-from civitas_runtime import (
+from civitasos_runtime import (
     Conscience,
     Decision,
     DecisionSource,

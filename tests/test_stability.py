@@ -17,7 +17,7 @@ import resource
 import sys
 import time
 
-# Ensure we can import civitas_runtime
+# Ensure we can import civitasos_runtime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Override before imports
@@ -31,12 +31,12 @@ def get_rss_mb() -> float:
 
 async def run_stability_test(n_ticks: int = 1000) -> bool:
     from civitasos import CivitasAgent
-    from civitas_runtime.loop import CognitiveLoop
-    from civitas_runtime.energy import Energy
-    from civitas_runtime.conscience import Conscience
-    from civitas_runtime.rules import RulesEngine
-    from civitas_runtime.tools import ToolRegistry
-    from civitas_runtime.memory import HybridMemory
+    from civitasos_runtime.loop import CognitiveLoop
+    from civitasos_runtime.energy import Energy
+    from civitasos_runtime.conscience import Conscience
+    from civitasos_runtime.rules import RulesEngine
+    from civitasos_runtime.tools import ToolRegistry
+    from civitasos_runtime.memory import HybridMemory
 
     # ── Stub LLM (no network calls) ──────────────────────────────────
     class StubLLM:

@@ -38,14 +38,14 @@ TEST_DID = "did:civ:gateway_test_001"
 async def start_gateway():
     """Start the CivitasGateway in the background and return cleanup coro."""
     from civitasos import CivitasAgent
-    from civitas_runtime import (
+    from civitasos_runtime import (
         CivitasGateway,
         Conscience,
         Energy,
         GatewayConfig,
         ToolRegistry,
     )
-    from civitas_runtime.llm import OpenAIAdapter
+    from civitasos_runtime.llm import OpenAIAdapter
 
     # Create SDK agent
     agent = CivitasAgent(base_url=BACKEND_URL)

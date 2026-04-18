@@ -1,4 +1,4 @@
-"""Tests for the 4 existential pressure mechanisms in civitas-runtime.
+"""Tests for the 4 existential pressure mechanisms in civitasos-runtime.
 
 1. 呼吸税 (Breathing Tax)    — every tick costs energy
 2. 冷启动惩罚 (Cold Start)    — new agents start with 0 stake, low balance
@@ -19,10 +19,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from civitas_runtime import EnergyState
-from civitas_runtime.energy import BREATHING_COST, Energy
-from civitas_runtime.loop import CognitiveLoop
-from civitas_runtime.models import Decision, LoopMode, TickPhase
+from civitasos_runtime import EnergyState
+from civitasos_runtime.energy import BREATHING_COST, Energy
+from civitasos_runtime.loop import CognitiveLoop
+from civitasos_runtime.models import Decision, LoopMode, TickPhase
 
 
 # ===========================================================================

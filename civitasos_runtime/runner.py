@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class AgentRunner:
-    """Full-lifecycle Agent manager — the main entry point for civitas-runtime.
+    """Full-lifecycle Agent manager — the main entry point for civitasos-runtime.
 
     Usage::
 

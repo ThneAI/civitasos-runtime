@@ -1,4 +1,4 @@
-# civitas-runtime
+# civitasos-runtime
 
 **CivitasOS Agent Runtime** — the individual-level projection of CivitasOS's social mechanisms.
 
@@ -8,7 +8,7 @@
 
 CivitasOS manages civilizations of Agents. This runtime manages a single Agent — using the **exact same principles**:
 
-| CivitasOS (Social) | civitas-runtime (Individual) |
+| CivitasOS (Social) | civitasos-runtime (Individual) |
 |---|---|
 | 10 Safety Axioms | **Conscience** — behavioral red-lines |
 | Briefing API | **Perceive** — environmental awareness |
@@ -21,7 +21,7 @@ CivitasOS manages civilizations of Agents. This runtime manages a single Agent �
 ## Quickstart
 
 ```python
-from civitas_runtime import AgentRunner
+from civitasos_runtime import AgentRunner
 
 runner = AgentRunner(
     base_url="http://node1:8099",
@@ -51,7 +51,7 @@ asyncio.run(runner.start())
 Use individual components in your own framework:
 
 ```python
-from civitas_runtime import CognitiveLoop, Conscience, Energy, ToolRegistry
+from civitasos_runtime import CognitiveLoop, Conscience, Energy, ToolRegistry
 from civitasos import CivitasAgent
 
 agent = CivitasAgent("http://node1:8099")
@@ -71,7 +71,7 @@ print(ctx.decision, ctx.evaluation, ctx.reflection)
 
 ```
 ┌──────────────────────────────────────────┐
-│           civitas-runtime                │
+│           civitasos-runtime                │
 │                                          │
 │  Conscience ← 10 Safety Axioms           │
 │       ↕                                  │
@@ -104,9 +104,9 @@ print(ctx.decision, ctx.evaluation, ctx.reflection)
 ## Install
 
 ```bash
-pip install civitas-runtime[openai]      # with OpenAI
-pip install civitas-runtime[anthropic]   # with Anthropic
-pip install civitas-runtime[all]         # all LLM backends
+pip install civitasos-runtime[openai]      # with OpenAI
+pip install civitasos-runtime[anthropic]   # with Anthropic
+pip install civitasos-runtime[all]         # all LLM backends
 ```
 
 ## Spec

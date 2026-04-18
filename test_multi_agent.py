@@ -136,9 +136,9 @@ async def test_3_independent_state(alpha, beta):
     logger.info("Test 3: Independent Agent State")
     logger.info("=" * 60)
 
-    from civitas_runtime.conscience import Conscience
-    from civitas_runtime.energy import Energy
-    from civitas_runtime.models import Decision, EnergyState
+    from civitasos_runtime.conscience import Conscience
+    from civitasos_runtime.energy import Energy
+    from civitasos_runtime.models import Decision, EnergyState
 
     # Separate energy states
     e_a = Energy()
@@ -189,8 +189,8 @@ async def test_4_vmv_decision_pipeline(alpha, beta):
     logger.info("Test 4: VMV Decision Pipeline (观 + R2R)")
     logger.info("=" * 60)
 
-    from civitas_runtime.conscience import Conscience
-    from civitas_runtime.models import Decision, EnergyState
+    from civitasos_runtime.conscience import Conscience
+    from civitasos_runtime.models import Decision, EnergyState
 
     c = Conscience()
 
