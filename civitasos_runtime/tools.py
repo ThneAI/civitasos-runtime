@@ -221,19 +221,51 @@ class ToolRegistry:
 
     # -- Execution ----------------------------------------------------------
 
+    @staticmethod
+    def _filter_params(fn: Callable[..., Any], params: dict[str, Any]) -> dict[str, Any]:
+        """Drop kwargs the target callable does not accept (LLM hallucination guard)."""
+        if not params:
+            return {}
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return dict(params)
+        accepts_var_kw = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        if accepts_var_kw:
+            return dict(params)
+        accepted = {n for n, p in sig.parameters.items()
+                    if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                  inspect.Parameter.KEYWORD_ONLY)
+                    and n != "self"}
+        cleaned: dict[str, Any] = {}
+        dropped: list[str] = []
+        for k, v in params.items():
+            if k in accepted:
+                cleaned[k] = v
+            else:
+                dropped.append(k)
+        if dropped:
+            logger.warning(
+                "Tool '%s': dropping unknown kwargs from LLM: %s",
+                getattr(fn, "__name__", "<fn>"), dropped,
+            )
+        return cleaned
+
     def execute(self, name: str, params: dict[str, Any]) -> Any:
         """Execute a tool by name with given params."""
         fn = self._executors.get(name)
         if fn is None:
             raise KeyError(f"Tool '{name}' not registered.")
-        return fn(**params)
+        return fn(**self._filter_params(fn, params))
 
     async def aexecute(self, name: str, params: dict[str, Any]) -> Any:
         """Execute a tool, awaiting if it's async."""
         fn = self._executors.get(name)
         if fn is None:
             raise KeyError(f"Tool '{name}' not registered.")
-        result = fn(**params)
+        result = fn(**self._filter_params(fn, params))
         if inspect.isawaitable(result):
             return await result
         return result
