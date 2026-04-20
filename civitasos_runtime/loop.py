@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -29,6 +30,60 @@ from .rules import RulesEngine
 from .tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_identity_profile(name: str, capabilities: list[str]) -> dict[str, Any]:
+    """Derive a stable identity profile from static agent traits."""
+    caps = sorted(c.strip().lower() for c in capabilities if c and c.strip())
+    seed = f"{name.strip().lower()}|{','.join(caps)}"
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+
+    strategy_axis = ("pragmatic", "exploratory", "conservative", "dialectical")
+    relation_axis = ("bridge", "guardian", "broker", "challenger")
+    expression_axis = ("concise", "analytic", "narrative", "evidence_first")
+
+    return {
+        "profile_id": digest[:12],
+        "strategy_axis": strategy_axis[int(digest[0:2], 16) % len(strategy_axis)],
+        "relation_axis": relation_axis[int(digest[2:4], 16) % len(relation_axis)],
+        "expression_axis": expression_axis[int(digest[4:6], 16) % len(expression_axis)],
+        "risk_bias": round((int(digest[6:8], 16) / 255.0), 3),
+        "seed": seed,
+    }
+
+
+def _identity_prompt_block(profile: dict[str, Any], trace: list[dict[str, Any]]) -> str:
+    """Render a compact, stable identity-emergence system prompt block."""
+    trace_lines: list[str] = []
+    for item in trace[-3:]:
+        tick = item.get("tick", "")
+        action = item.get("action", "")
+        success = item.get("success")
+        aspect_bucket = item.get("aspect_bucket", "")
+        trace_lines.append(
+            f"- tick={tick} action={action} success={success} aspect={aspect_bucket}"
+        )
+    trace_text = "\n".join(trace_lines) if trace_lines else "- none"
+    return (
+        "\n\nIdentity Emergence 基线:\n"
+        f"- profile_id: {profile.get('profile_id')}\n"
+        f"- strategy_axis: {profile.get('strategy_axis')}\n"
+        f"- relation_axis: {profile.get('relation_axis')}\n"
+        f"- expression_axis: {profile.get('expression_axis')}\n"
+        f"- risk_bias: {profile.get('risk_bias')}\n"
+        "要求:\n"
+        "1) 在连续 tick 中保持身份风格一致，不要每轮重置人格。\n"
+        "2) 允许适应环境，但要解释为何偏离既有风格。\n"
+        "3) 优先做能强化长期关系质量与可问责性的行动。\n"
+        f"最近身份轨迹:\n{trace_text}"
+    )
 
 
 def _is_empty_output(output: Any) -> bool:
@@ -136,6 +191,10 @@ class CognitiveLoop:
         self._name = agent_name
         self._capabilities = capabilities or []
         self._memory = memory
+        self._identity_emergence_enabled = _env_flag(
+            "CIVITASOS_IDENTITY_EMERGENCE_ENABLED", default=False,
+        )
+        self._identity_profile = _build_identity_profile(self._name, self._capabilities)
         self._mode = LoopMode.IDLE
         self._tick_count = 0
         self._wake_event: asyncio.Event | None = None
@@ -372,6 +431,13 @@ class CognitiveLoop:
         last_tick = _get("last_tick_summary")
         if last_tick:
             memories["last_tick"] = last_tick
+        if self._identity_emergence_enabled:
+            profile = _get("identity_profile")
+            if profile:
+                memories["identity_profile"] = profile
+            trace = _get("identity_trace")
+            if isinstance(trace, list) and trace:
+                memories["identity_trace"] = trace[-10:]
 
         # Semantic recall: find similar episodes based on current context
         try:
@@ -446,6 +512,10 @@ class CognitiveLoop:
                 f"平均信任: {energy.peer_trust_avg:.2f}。\n"
                 f"优先与高信任 Agent 协作，警惕低信任交互。"
             )
+        if self._identity_emergence_enabled:
+            trace = memories.get("identity_trace")
+            trace_list = trace if isinstance(trace, list) else []
+            system += _identity_prompt_block(self._identity_profile, trace_list)
 
         # Fix 3: 任务交付强制 — 已认领任务必须立即调用 task_execute，禁止 wait。
         # 否则 LLM 倾向反复观望，导致 Claimed 任务永不交付。
@@ -624,6 +694,32 @@ class CognitiveLoop:
                     logger.debug("Failed to save %s", key)
 
         _save("last_tick_summary", summary)
+        if self._identity_emergence_enabled:
+            if self._memory is not None:
+                identity_trace = self._memory.recall("identity_trace") or []
+            else:
+                try:
+                    identity_trace = self._agent.recall("identity_trace") or []
+                except Exception:
+                    identity_trace = []
+            if not isinstance(identity_trace, list):
+                identity_trace = []
+            aspect_gap = self._energy.state.aspect_gap
+            if aspect_gap >= 0.5:
+                aspect_bucket = "high"
+            elif aspect_gap >= 0.2:
+                aspect_bucket = "mid"
+            else:
+                aspect_bucket = "low"
+            identity_trace.append({
+                "tick": ctx.tick_id,
+                "action": ctx.decision.action if ctx.decision else "none",
+                "success": ctx.evaluation.success if ctx.evaluation else None,
+                "aspect_bucket": aspect_bucket,
+            })
+            identity_trace = identity_trace[-30:]
+            _save("identity_profile", self._identity_profile)
+            _save("identity_trace", identity_trace)
 
         # Log episode for long-term memory
         if ctx.decision and ctx.decision.action != "wait":
