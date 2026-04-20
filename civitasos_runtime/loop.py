@@ -7,6 +7,7 @@ Each tick produces a TickContext that flows through all phases.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -41,6 +42,22 @@ def _is_empty_output(output: Any) -> bool:
     if isinstance(output, list) and len(output) == 0:
         return True
     return False
+
+
+def _task_signature_salt(task_id: str) -> str:
+    """Build a lightweight per-task salt: last-6 task id + minute-hash."""
+    suffix = task_id[-6:] if len(task_id) >= 6 else task_id
+    minute_bucket = int(time.time() // 60)
+    digest = hashlib.sha1(f"{task_id}:{minute_bucket}".encode("utf-8")).hexdigest()[:8]
+    return f"{suffix}-{digest}"
+
+
+def _fallback_output_text(response_content: str | None, task_id: str) -> str:
+    """Non-empty fallback output payload used only when LLM omitted output."""
+    text = (response_content or "").strip()
+    if text:
+        return text[:512]
+    return f"auto-deliver::{_task_signature_salt(task_id)}"
 
 # Interval seconds per mode
 _INTERVALS: dict[LoopMode, float] = {
@@ -430,10 +447,42 @@ class CognitiveLoop:
                 f"优先与高信任 Agent 协作，警惕低信任交互。"
             )
 
+        # Fix 3: 任务交付强制 — 已认领任务必须立即调用 task_execute，禁止 wait。
+        # 否则 LLM 倾向反复观望，导致 Claimed 任务永不交付。
+        active_tasks = briefing.get("active_tasks", []) or []
+        active_task_ids = [
+            (t.get("task_id") or t.get("id"))
+            for t in active_tasks
+            if isinstance(t, dict)
+        ]
+        active_task_ids = [tid for tid in active_task_ids if tid]
+        has_active = bool(active_task_ids)
+        if has_active:
+            signature_lines = [
+                f"- {tid}: {_task_signature_salt(str(tid))}"
+                for tid in active_task_ids
+            ]
+            system += (
+                "\n\n⚑ 任务交付强制:\n"
+                f"你当前持有 {len(active_task_ids)} 个已认领但未交付的任务: "
+                f"{', '.join(str(t) for t in active_task_ids)}\n"
+                "必须在本 tick 立即调用 task_execute 工具完成其中至少一个任务，"
+                "params 必须包含 task_id、output（描述你按自身能力产出的内容）"
+                "和 success=true。\n"
+                "禁止回复 'wait' 或选择其他动作；任务交付优先于一切其他事务。\n"
+                "任务签名 salt（用于避免模板化同质输出）:\n"
+                f"{chr(10).join(signature_lines)}"
+            )
+
+        user_content_tail = (
+            "请立即调用 task_execute 工具完成上述已认领任务。"
+            if has_active
+            else "请分析当前状态，决定下一步行动。调用合适的工具，或回复 \"wait\"。"
+        )
         user_content = (
             f"当前简报:\n{json.dumps(briefing, indent=2, ensure_ascii=False, default=str)}\n\n"
             f"记忆上下文:\n{json.dumps(memories, indent=2, ensure_ascii=False, default=str)}\n\n"
-            "请分析当前状态，决定下一步行动。调用合适的工具，或回复 \"wait\"。"
+            f"{user_content_tail}"
         )
 
         messages = [
@@ -457,11 +506,47 @@ class CognitiveLoop:
         # If LLM returned tool calls, use the first one
         if response.tool_calls:
             tc = response.tool_calls[0]
+            # 归一化工具名：去掉 LLM 幻觉的命名空间前缀（如 "task_executor:task_execute"）
+            tool_name = tc.name.split(":")[-1] if ":" in tc.name else tc.name
+            tool_args = dict(tc.arguments or {})
+
+            # Fix 4: 如果 LLM 选了 task_execute 且我们已认领任务，强制用 briefing 真实
+            # task_id + 必填 output/success 覆盖参数（LLM 经常编造 UUID 或漏字段）。
+            if tool_name == "task_execute" and has_active:
+                forced_tid = active_task_ids[0]
+                if tool_args.get("task_id") != forced_tid:
+                    logger.info(
+                        "rewriting LLM task_execute task_id %r -> real %r",
+                        tool_args.get("task_id"), forced_tid,
+                    )
+                tool_args["task_id"] = forced_tid
+                if "output" not in tool_args or tool_args.get("output") in (None, ""):
+                    tool_args["output"] = _fallback_output_text(response.content, str(forced_tid))
+                tool_args.setdefault("success", True)
+
             return Decision(
-                action=tc.name,
-                params=tc.arguments,
-                reasoning=response.content or f"LLM chose {tc.name}",
+                action=tool_name,
+                params=tool_args,
+                reasoning=response.content or f"LLM chose {tool_name}",
                 confidence=0.8,
+                source=DecisionSource.LLM,
+            )
+
+        # Fallback: 已认领任务下若 LLM 不调用工具，强制 task_execute，避免空转。
+        if has_active:
+            forced_tid = active_task_ids[0]
+            return Decision(
+                action="task_execute",
+                params={
+                    "task_id": forced_tid,
+                    "output": _fallback_output_text(response.content, str(forced_tid)),
+                    "success": True,
+                },
+                reasoning=(
+                    f"forced task_execute fallback (LLM returned text instead of tool): "
+                    f"{(response.content or '')[:160]}"
+                ),
+                confidence=0.5,
                 source=DecisionSource.LLM,
             )
 

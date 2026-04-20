@@ -346,6 +346,9 @@ class AgentRunner:
             port = self._gateway_config.port
             endpoint = f"http://{host}:{port}"
 
+        # Newer backends may require JWT even for A2A registration routes.
+        self._bootstrap_demo_jwt()
+
         try:
             self._agent.a2a_quickstart(
                 name=self._name,
@@ -366,6 +369,46 @@ class AgentRunner:
             except Exception:
                 logger.exception("Agent registration failed entirely")
                 raise
+
+    def _bootstrap_demo_jwt(self) -> None:
+        """Best-effort demo-login bootstrap for JWT-protected dev backends."""
+        if getattr(self._agent, "_jwt_token", None):
+            return
+        candidates = [
+            getattr(self._agent, "_agent_id", None),
+            self._name.lower().replace(" ", "_"),
+            self._name,
+        ]
+        base_url = str(self._base_url[0] if isinstance(self._base_url, list) else self._base_url).rstrip("/")
+        try:
+            import json as _json
+            import time as _time
+            import urllib.request as _ur
+        except Exception:
+            return
+
+        for cid in candidates:
+            if not cid:
+                continue
+            try:
+                req = _ur.Request(
+                    f"{base_url}/api/v1/auth/demo-login",
+                    data=_json.dumps({"agent_id": cid}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with _ur.urlopen(req, timeout=10) as resp:
+                    body = _json.loads(resp.read().decode("utf-8"))
+                token = body.get("token") or body.get("data", {}).get("token")
+                if not token:
+                    continue
+                self._agent._jwt_token = token
+                expires_in = body.get("expires_in") or body.get("data", {}).get("expires_in") or 3600
+                self._agent._jwt_expires_at = _time.time() + int(expires_in)
+                logger.info("Demo-login token bootstrapped for %s", cid)
+                return
+            except Exception:
+                continue
 
     async def _register_webhook(self) -> None:
         """Register a webhook so CivitasOS pushes task events to our /v1/wake."""
