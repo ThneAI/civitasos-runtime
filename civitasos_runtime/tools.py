@@ -246,6 +246,20 @@ class ToolRegistry:
                 cleaned[k] = v
             else:
                 dropped.append(k)
+
+        # Normalize known SDK schema hotspots so malformed LLM args do not
+        # hard-fail the HTTP layer (e.g., metadata must be Dict[str, str]).
+        fn_name = getattr(fn, "__name__", "")
+        if fn_name == "task_execute" and "metadata" in cleaned:
+            metadata = cleaned.get("metadata")
+            if isinstance(metadata, dict):
+                cleaned["metadata"] = {
+                    str(k): (v if isinstance(v, str) else str(v))
+                    for k, v in metadata.items()
+                }
+            else:
+                cleaned.pop("metadata", None)
+
         if dropped:
             logger.warning(
                 "Tool '%s': dropping unknown kwargs from LLM: %s",
