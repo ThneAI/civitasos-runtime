@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import pathlib
 import signal
 from typing import Any, Callable
 
@@ -349,6 +350,13 @@ class AgentRunner:
         # Newer backends may require JWT even for A2A registration routes.
         self._bootstrap_demo_jwt()
 
+        if self._institutional_identity_enabled():
+            logger.info(
+                "Institutional identity enabled — registering via birth-proposal"
+            )
+            self._register_via_birth_proposal(endpoint=endpoint)
+            return
+
         try:
             self._agent.a2a_quickstart(
                 name=self._name,
@@ -356,7 +364,14 @@ class AgentRunner:
                 description=f"Autonomous agent: {', '.join(self._capabilities)}",
             )
             logger.info("Agent registered via a2a_quickstart (endpoint=%s)", endpoint)
-        except Exception:
+        except Exception as exc:
+            if self._is_sponsor_required_error(exc):
+                logger.warning(
+                    "a2a_quickstart rejected with sponsor_required — "
+                    "falling back to birth-proposal"
+                )
+                self._register_via_birth_proposal(endpoint=endpoint)
+                return
             logger.warning("a2a_quickstart failed, trying register()")
             try:
                 self._agent.register(
@@ -366,9 +381,134 @@ class AgentRunner:
                     stake=self._stake,
                 )
                 logger.info("Agent registered via register()")
-            except Exception:
+            except Exception as register_exc:
+                if self._is_sponsor_required_error(register_exc):
+                    logger.warning(
+                        "register() rejected with sponsor_required — "
+                        "falling back to birth-proposal"
+                    )
+                    self._register_via_birth_proposal(endpoint=endpoint)
+                    return
                 logger.exception("Agent registration failed entirely")
                 raise
+
+    @staticmethod
+    def _env_flag_enabled(name: str) -> bool:
+        return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _institutional_identity_enabled(self) -> bool:
+        return self._env_flag_enabled("CIVITASOS_INSTITUTIONAL_IDENTITY_ENABLED")
+
+    @staticmethod
+    def _is_sponsor_required_error(exc: Exception) -> bool:
+        return "sponsor_required" in str(exc).lower()
+
+    def _resolve_birth_sponsor(self) -> str:
+        for key in ("CIVITASOS_BIRTH_SPONSOR", "BENCHMARK_BIRTH_SPONSOR"):
+            sponsor = os.getenv(key, "").strip()
+            if sponsor:
+                return sponsor
+        return "@guardian"
+
+    def _derive_birth_alias(self) -> str:
+        env_alias = os.getenv("AGENT_ALIAS", "").strip()
+        if env_alias:
+            raw = env_alias
+        elif self._identity_file:
+            raw = pathlib.Path(self._identity_file).stem
+        else:
+            raw = self._name
+        normalized = []
+        for ch in raw.lower():
+            if ch.isalnum():
+                normalized.append(ch)
+            elif ch in {" ", "-", "_"}:
+                normalized.append("-")
+        alias = "".join(normalized).strip("-")
+        while "--" in alias:
+            alias = alias.replace("--", "-")
+        return alias or "civitas-agent"
+
+    def _build_birth_capabilities(self) -> list[dict[str, Any]]:
+        caps: list[dict[str, Any]] = []
+        for cap in self._capabilities:
+            cap_id = cap.strip()
+            if not cap_id:
+                continue
+            caps.append(
+                {
+                    "id": cap_id,
+                    "name": cap_id.replace("_", " ").title(),
+                    "description": f"Runtime capability: {cap_id}",
+                    "input_schema": None,
+                    "output_schema": None,
+                }
+            )
+        return caps
+
+    def _register_via_birth_proposal(self, *, endpoint: str) -> None:
+        public_key = getattr(self._agent, "_public_key_hex", None)
+        if not public_key:
+            raise RuntimeError("birth-proposal requires an agent public key")
+
+        sponsor = self._resolve_birth_sponsor()
+        stake = int(
+            os.getenv(
+                "CIVITASOS_BIRTH_STAKE",
+                os.getenv("BENCHMARK_BIRTH_STAKE", str(self._stake)),
+            )
+        )
+        intent = (
+            os.getenv("CIVITASOS_BIRTH_INTENT", "").strip()
+            or os.getenv("BENCHMARK_BIRTH_INTENT", "").strip()
+            or f"runtime bootstrap: {self._name}"
+        )
+        obligations = [
+            o.strip()
+            for o in os.getenv(
+                "CIVITASOS_BIRTH_OBLIGATIONS",
+                os.getenv("BENCHMARK_BIRTH_OBLIGATIONS", "complete_assigned_tasks"),
+            ).split(",")
+            if o.strip()
+        ]
+        if not obligations:
+            obligations = ["complete_assigned_tasks"]
+
+        payload: dict[str, Any] = {
+            "public_key": public_key,
+            "name": self._name,
+            "alias": self._derive_birth_alias(),
+            "sponsor": sponsor,
+            "intent": intent,
+            "stake": stake,
+            "description": f"Autonomous agent: {', '.join(self._capabilities)}",
+            "capabilities": self._build_birth_capabilities(),
+            "obligations": obligations,
+        }
+        if endpoint:
+            payload["endpoint"] = endpoint
+
+        incubation_raw = os.getenv("CIVITASOS_BIRTH_INCUBATION_EPOCHS", "").strip()
+        if incubation_raw:
+            payload["incubation_epochs"] = int(incubation_raw)
+
+        resp = self._agent._post("/agents/birth-proposal", payload)
+        if not resp.success:
+            hint = f" (hint: {resp.hint})" if getattr(resp, "hint", None) else ""
+            raise RuntimeError(f"birth-proposal failed: {resp.error}{hint}")
+
+        data = resp.data if isinstance(resp.data, dict) else {}
+        agent = data.get("agent", {}) if isinstance(data, dict) else {}
+        did = agent.get("did") or data.get("did")
+        if not did:
+            raise RuntimeError("birth-proposal response missing did")
+        self._agent._agent_id = str(did)
+        logger.info(
+            "Agent registered via birth-proposal did=%s sponsor=%s endpoint=%s",
+            did,
+            sponsor,
+            endpoint or "<default>",
+        )
 
     def _bootstrap_demo_jwt(self) -> None:
         """Best-effort demo-login bootstrap for JWT-protected dev backends."""
