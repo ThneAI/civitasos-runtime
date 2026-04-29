@@ -13,6 +13,7 @@ import logging
 import os
 import time
 from typing import Any
+from urllib.parse import quote
 
 from .conscience import Conscience
 from .energy import Energy
@@ -84,6 +85,93 @@ def _identity_prompt_block(profile: dict[str, Any], trace: list[dict[str, Any]])
         "3) 优先做能强化长期关系质量与可问责性的行动。\n"
         f"最近身份轨迹:\n{trace_text}"
     )
+
+
+def _institutional_identity_prompt_block(identity: dict[str, Any]) -> str:
+    """Render the II-1 institutional identity status into the LLM system prompt."""
+    state = str(identity.get("state", "UNKNOWN") or "UNKNOWN").upper()
+    sponsor = identity.get("sponsor_did") or "none"
+    remaining = identity.get("remaining_epochs")
+    obligations = identity.get("obligations") or []
+    obligations_text = ", ".join(str(o) for o in obligations[:3]) if obligations else "none"
+    age_in_epochs = identity.get("age_in_epochs")
+    at_risk = bool(identity.get("at_risk"))
+
+    lines = [
+        "\n\n制度性身份状态:",
+        f"- state: {state}",
+        f"- sponsor: {sponsor}",
+        f"- age_in_epochs: {age_in_epochs if age_in_epochs is not None else 'unknown'}",
+        (
+            f"- remaining_epochs: {remaining}"
+            if remaining is not None
+            else "- remaining_epochs: unknown"
+        ),
+        f"- obligations: {obligations_text}",
+    ]
+
+    if state == "PROVISIONAL":
+        lines.extend(
+            [
+                "要求:",
+                "1) 你仍处于孵化期，不得把自己当成已完成身份。",
+                "2) 优先完成 obligations，再考虑扩张性行动。",
+                "3) 选择低风险、可验证、能维持 sponsor 信任的动作。",
+            ]
+        )
+        if at_risk:
+            lines.append("4) 你已接近 obligation_expiry，必须优先避免失权或清算。")
+    elif state == "LIQUIDATED":
+        lines.extend(
+            [
+                "要求:",
+                "1) 你已处于 LIQUIDATED 状态，任何受保护动作都可能被拒绝。",
+                "2) 优先查询状态、记录失败原因，不要假设自己仍有正常权限。",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def _opt_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_identity_summary(
+    payload: dict[str, Any],
+    *,
+    current_epoch: int | None,
+) -> dict[str, Any]:
+    """Project backend identity-state payload into a compact runtime summary."""
+    state = str(payload.get("state", "UNKNOWN") or "UNKNOWN").upper()
+    if current_epoch is None:
+        current_epoch = _opt_int(payload.get("current_epoch"))
+    expiry = _opt_int(payload.get("obligation_expiry_epoch"))
+    remaining_epochs = None
+    if expiry is not None and current_epoch is not None:
+        remaining_epochs = max(expiry - current_epoch, 0)
+    obligations = payload.get("obligations")
+    if not isinstance(obligations, list):
+        obligations = []
+    obligations = [str(item) for item in obligations if str(item).strip()]
+    return {
+        "did": payload.get("did"),
+        "alias": payload.get("alias"),
+        "state": state,
+        "sponsor_did": payload.get("sponsor_did"),
+        "birth_intent": payload.get("birth_intent"),
+        "stake_locked": _opt_int(payload.get("stake_locked")) or 0,
+        "obligations": obligations,
+        "obligation_expiry_epoch": expiry,
+        "age_in_epochs": _opt_int(payload.get("age_in_epochs")),
+        "remaining_epochs": remaining_epochs,
+        "at_risk": state == "PROVISIONAL" and remaining_epochs is not None and remaining_epochs <= 1,
+    }
 
 
 def _is_empty_output(output: Any) -> bool:
@@ -194,6 +282,10 @@ class CognitiveLoop:
         self._identity_emergence_enabled = _env_flag(
             "CIVITASOS_IDENTITY_EMERGENCE_ENABLED", default=False,
         )
+        self._institutional_identity_enabled = _env_flag(
+            "CIVITASOS_INSTITUTIONAL_IDENTITY_ENABLED", default=False,
+        )
+        self._last_identity_summary: dict[str, Any] | None = None
         self._identity_profile = _build_identity_profile(self._name, self._capabilities)
         self._mode = LoopMode.IDLE
         self._tick_count = 0
@@ -337,6 +429,10 @@ class CognitiveLoop:
                         duration_ms=ctx.evaluation.duration_ms,
                     )
 
+            # Keep a local aspect-gap signal alive even when backend R2R
+            # telemetry is unavailable (common in benchmark mode).
+            self._update_local_aspect_gap_from_tick(ctx)
+
             # 7. Reflect
             ctx.phase = TickPhase.REFLECT
             ctx.reflection = self._reflect(ctx)
@@ -369,6 +465,7 @@ class CognitiveLoop:
 
         # Update energy from economics
         self._energy.refresh(briefing.get("economics", {}))
+        briefing["_identity_prompt_injected"] = False
 
         # Fix 1: 观 → 决策管线 — fetch aspect gap
         try:
@@ -406,6 +503,8 @@ class CognitiveLoop:
                             }
         except Exception:
             logger.debug("R2R flow health not available")
+
+        self._inject_institutional_identity_summary(briefing)
 
         return briefing
 
@@ -516,6 +615,11 @@ class CognitiveLoop:
             trace = memories.get("identity_trace")
             trace_list = trace if isinstance(trace, list) else []
             system += _identity_prompt_block(self._identity_profile, trace_list)
+
+        identity = briefing.get("identity")
+        if isinstance(identity, dict) and identity:
+            system += _institutional_identity_prompt_block(identity)
+            briefing["_identity_prompt_injected"] = True
 
         # Fix 3: 任务交付强制 — 已认领任务必须立即调用 task_execute，禁止 wait。
         # 否则 LLM 倾向反复观望，导致 Claimed 任务永不交付。
@@ -634,6 +738,90 @@ class CognitiveLoop:
             reasoning=response.content or "LLM did not call a tool",
             source=DecisionSource.LLM,
         )
+
+    def _update_local_aspect_gap_from_tick(self, ctx: TickContext) -> None:
+        """Update aspect_gap from local evidence when remote R2R data is missing.
+
+        Signal sources are intentionally lightweight:
+        - failed evaluation / conscience deny -> increase divergence pressure
+        - sustained successful delivery        -> decrease pressure
+        - low peer trust                       -> add baseline pressure
+        """
+        state = self._energy.state
+        gap = float(state.aspect_gap)
+
+        if ctx.conscience_verdict is not None and not ctx.conscience_verdict.allowed:
+            gap += 0.20
+
+        if ctx.evaluation is not None:
+            if ctx.evaluation.success:
+                gap -= 0.10
+            else:
+                gap += 0.15
+
+        decision = ctx.decision.action if ctx.decision else ""
+        if decision == "wait":
+            gap += 0.02
+
+        # Lower social trust should bias aspect-gap upward.
+        if state.peer_trust_avg < 0.5:
+            gap += (0.5 - state.peer_trust_avg) * 0.20
+
+        state.aspect_gap = max(0.0, min(1.0, gap))
+
+    def _inject_institutional_identity_summary(self, briefing: dict[str, Any]) -> None:
+        """Best-effort fetch of II-1 identity-state; never raises."""
+        if not self._institutional_identity_enabled:
+            return
+        agent_id = getattr(self._agent, "agent_id", None) or getattr(self._agent, "_agent_id", None)
+        if not agent_id or not hasattr(self._agent, "_get"):
+            return
+        try:
+            encoded = quote(str(agent_id), safe="")
+            resp = self._agent._get(f"/agents/{encoded}/identity-state")
+        except Exception:
+            logger.debug("identity-state fetch failed", exc_info=True)
+            self._reuse_cached_identity_summary(briefing)
+            return
+
+        if not getattr(resp, "success", False):
+            logger.debug("identity-state unavailable for %s: %s", agent_id, getattr(resp, "error", None))
+            self._reuse_cached_identity_summary(briefing)
+            return
+
+        payload = getattr(resp, "data", None)
+        if not isinstance(payload, dict):
+            self._reuse_cached_identity_summary(briefing)
+            return
+        economics = briefing.get("economics")
+        current_epoch = None
+        if isinstance(economics, dict):
+            current_epoch = _opt_int(economics.get("current_epoch"))
+        identity = _normalize_identity_summary(
+            payload,
+            current_epoch=current_epoch,
+        )
+        briefing["identity"] = identity
+        self._last_identity_summary = dict(identity)
+
+    def _reuse_cached_identity_summary(self, briefing: dict[str, Any]) -> None:
+        """Keep identity context stable across transient identity-state misses."""
+        if not self._last_identity_summary:
+            return
+        identity = dict(self._last_identity_summary)
+        economics = briefing.get("economics")
+        current_epoch = None
+        if isinstance(economics, dict):
+            current_epoch = _opt_int(economics.get("current_epoch"))
+        expiry = _opt_int(identity.get("obligation_expiry_epoch"))
+        if expiry is not None and current_epoch is not None:
+            remaining = max(expiry - current_epoch, 0)
+            identity["remaining_epochs"] = remaining
+            identity["at_risk"] = (
+                str(identity.get("state", "")).upper() == "PROVISIONAL"
+                and remaining <= 1
+            )
+        briefing["identity"] = identity
 
     def _reflect(self, ctx: TickContext) -> str:
         """Generate reflection text from evaluation results + aspect gap."""

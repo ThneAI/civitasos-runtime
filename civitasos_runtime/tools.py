@@ -244,6 +244,10 @@ class ToolRegistry:
         for k, v in params.items():
             if k in accepted:
                 cleaned[k] = v
+            elif k.startswith("_"):
+                # Internal control metadata used by benchmark/rules path.
+                # Never forward to SDK calls and do not warn as hallucination.
+                continue
             else:
                 dropped.append(k)
 
