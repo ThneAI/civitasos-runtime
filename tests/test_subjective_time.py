@@ -8,7 +8,7 @@ from civitasos_runtime.energy import Energy
 from civitasos_runtime.loop import CognitiveLoop
 from civitasos_runtime.memory import HybridMemory
 from civitasos_runtime.models import Decision, LifecycleStage, LLMResponse, LoopMode
-from civitasos_runtime.subjective_time import build_subjective_time
+from civitasos_runtime.subjective_time import build_subjective_time, rank_time_weighted_memories
 
 
 class DummyAgent:
@@ -133,3 +133,56 @@ class TestSubjectiveTime:
         assert [item["key"] for item in ranked] == ["new", "old"]
         assert ranked[0]["decay_weight"] > ranked[1]["decay_weight"]
         memory.close()
+
+    def test_remote_semantic_recall_is_reranked_by_time_decay(self):
+        now = datetime(2026, 4, 30, tzinfo=timezone.utc)
+        items = [
+            {
+                "id": "old-first",
+                "content": "semantically top but stale",
+                "created_at": (now - timedelta(days=12)).isoformat(),
+            },
+            {
+                "id": "fresh-second",
+                "content": "slightly lower semantic rank but fresh",
+                "created_at": (now - timedelta(hours=1)).isoformat(),
+            },
+        ]
+
+        ranked = rank_time_weighted_memories(
+            items,
+            top_k=2,
+            half_life_days=1.0,
+            now=now,
+        )
+
+        assert [item["id"] for item in ranked] == ["fresh-second", "old-first"]
+        assert ranked[0]["semantic_rank"] == 2
+        assert ranked[0]["decay_weight"] > ranked[1]["decay_weight"]
+
+    def test_loop_applies_time_decay_to_remote_similar_episodes(self):
+        now = datetime.now(timezone.utc)
+
+        class RemoteMemoryAgent(DummyAgent):
+            def recall_similar(self, _query, top_k=3):
+                assert top_k == 10
+                return [
+                    {
+                        "id": "old",
+                        "created_at": (now - timedelta(days=10)).isoformat(),
+                    },
+                    {
+                        "id": "new",
+                        "created_at": (now - timedelta(minutes=5)).isoformat(),
+                    },
+                ]
+
+        loop = CognitiveLoop(RemoteMemoryAgent(), llm=DummyLLM())
+        memories = asyncio.run(loop._recall({
+            "active_tasks": [],
+            "subjective_time": {"memory_half_life_days": 1.0},
+        }))
+
+        assert memories["similar_episodes"][0]["id"] == "new"
+        assert memories["remote_memory_decay"]["applied"] is True
+        assert memories["remote_memory_decay"]["source_count"] == 2

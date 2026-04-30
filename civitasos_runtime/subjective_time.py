@@ -111,3 +111,66 @@ def decay_weight(
     age_days = max((now - ts).total_seconds(), 0.0) / _DAY_SECONDS
     half_life_days = max(float(half_life_days), 0.001)
     return 0.5 ** (age_days / half_life_days)
+
+
+def memory_timestamp(item: Any) -> datetime | None:
+    """Extract a best-effort timestamp from local or remote memory payloads."""
+    if not isinstance(item, dict):
+        return None
+    candidates = [
+        item.get("timestamp"),
+        item.get("created_at"),
+        item.get("updated_at"),
+        item.get("remembered_at"),
+        item.get("stored_at"),
+        item.get("ts"),
+    ]
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.extend([
+            metadata.get("timestamp"),
+            metadata.get("created_at"),
+            metadata.get("updated_at"),
+            metadata.get("remembered_at"),
+            metadata.get("stored_at"),
+            metadata.get("ts"),
+        ])
+    for candidate in candidates:
+        parsed = parse_time(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def rank_time_weighted_memories(
+    items: list[Any],
+    *,
+    top_k: int = 3,
+    half_life_days: float = 7.0,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Fuse remote semantic rank with lifecycle-aware memory decay.
+
+    Remote CSP recall already ranks by semantic similarity. G.2 should not throw
+    that away, so the combined score is semantic-rank weight × time-decay weight.
+    Items without timestamps keep their semantic order with a neutral decay.
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    ranked: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        ts = memory_timestamp(item)
+        age_days = None
+        weight = 1.0
+        if ts is not None:
+            age_days = max((now - ts.astimezone(timezone.utc)).total_seconds(), 0.0) / _DAY_SECONDS
+            weight = decay_weight(ts, now=now, half_life_days=half_life_days)
+        semantic_rank_weight = 1.0 / float(idx + 1)
+        payload = dict(item) if isinstance(item, dict) else {"value": item}
+        payload["semantic_rank"] = idx + 1
+        payload["semantic_rank_weight"] = semantic_rank_weight
+        payload["age_days"] = age_days
+        payload["decay_weight"] = weight
+        payload["combined_recall_weight"] = semantic_rank_weight * weight
+        ranked.append(payload)
+    ranked.sort(key=lambda entry: entry["combined_recall_weight"], reverse=True)
+    return ranked[:top_k]

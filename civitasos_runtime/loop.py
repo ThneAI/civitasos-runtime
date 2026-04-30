@@ -30,7 +30,7 @@ from .models import (
     TickPhase,
 )
 from .rules import RulesEngine
-from .subjective_time import build_subjective_time
+from .subjective_time import build_subjective_time, rank_time_weighted_memories
 from .tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -602,6 +602,12 @@ class CognitiveLoop:
         if last_tick:
             memories["last_tick"] = last_tick
         subjective = briefing.get("subjective_time")
+        memory_half_life_days = 7.0
+        if isinstance(subjective, dict):
+            try:
+                memory_half_life_days = float(subjective.get("memory_half_life_days") or 7.0)
+            except (TypeError, ValueError):
+                memory_half_life_days = 7.0
         if mem is not None and isinstance(subjective, dict):
             try:
                 memories["time_weighted_memory_keys"] = [
@@ -612,7 +618,7 @@ class CognitiveLoop:
                     }
                     for item in mem.recall_weighted(
                         top_k=5,
-                        half_life_days=float(subjective.get("memory_half_life_days") or 7.0),
+                        half_life_days=memory_half_life_days,
                     )
                 ]
             except Exception:
@@ -632,11 +638,20 @@ class CognitiveLoop:
                 for t in briefing.get("active_tasks", [])
             ) or ", ".join(self._capabilities) or self._name
             if mem is not None:
-                similar = mem.recall_similar(context_query, top_k=3)
+                similar = mem.recall_similar(context_query, top_k=10)
             else:
-                similar = self._agent.recall_similar(context_query, top_k=3)
+                similar = self._agent.recall_similar(context_query, top_k=10)
             if similar:
-                memories["similar_episodes"] = similar
+                memories["similar_episodes"] = rank_time_weighted_memories(
+                    list(similar),
+                    top_k=3,
+                    half_life_days=memory_half_life_days,
+                )
+                memories["remote_memory_decay"] = {
+                    "applied": True,
+                    "half_life_days": memory_half_life_days,
+                    "source_count": len(similar),
+                }
         except Exception:
             logger.debug("recall_similar not available or failed")
 
