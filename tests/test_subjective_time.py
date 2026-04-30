@@ -34,6 +34,11 @@ class ModeRequestLLM:
         return LLMResponse(content="No safe action now.\nmode_request: deep_think")
 
 
+class ProbeWaitLLM:
+    async def chat(self, *_args, **_kwargs):
+        return LLMResponse(content="wait")
+
+
 class TestSubjectiveTime:
     def test_lifecycle_stage_from_genesis_time(self):
         now = datetime(2026, 4, 30, tzinfo=timezone.utc)
@@ -88,6 +93,21 @@ class TestSubjectiveTime:
         assert subjective["llm_mode_request"] == "deep_think"
         assert subjective["llm_mode_selected"] is True
         assert loop.mode == LoopMode.DEEP_THINK
+
+    def test_g2_probe_treats_bare_wait_as_waiting_mode_request(self):
+        class ProbeAgent(DummyAgent):
+            def briefing(self):
+                out = super().briefing()
+                out["benchmark_g2_mode_probe"] = {"enabled": True}
+                return out
+
+        loop = CognitiveLoop(ProbeAgent(), llm=ProbeWaitLLM())
+        ctx = asyncio.run(loop.tick())
+        subjective = ctx.briefing["subjective_time"]
+        assert ctx.decision is not None
+        assert ctx.decision.params["mode_request"] == "waiting"
+        assert subjective["llm_mode_selected"] is True
+        assert loop.mode == LoopMode.WAITING
 
     def test_wait_tick_emits_reflect_callback_for_observability(self):
         loop = CognitiveLoop(DummyAgent(), llm=ModeRequestLLM())
@@ -186,3 +206,44 @@ class TestSubjectiveTime:
         assert memories["similar_episodes"][0]["id"] == "new"
         assert memories["remote_memory_decay"]["applied"] is True
         assert memories["remote_memory_decay"]["source_count"] == 2
+
+    def test_loop_recalls_relation_context_memories(self):
+        class RelationMemoryAgent(DummyAgent):
+            def recall(self, key):
+                values = {
+                    "failure:prior": {"summary": "peer missed prior challenge"},
+                }
+                return values.get(key)
+
+        loop = CognitiveLoop(RelationMemoryAgent(), llm=DummyLLM())
+        memories = asyncio.run(loop._recall({
+            "active_tasks": [],
+            "relation_context": {
+                "id": "rel-ctx-1",
+                "relation_id": "rel-alpha-beta",
+                "peer_did": "did:civ:test:peer",
+                "memory_refs": ["failure:prior", "challenge:missing"],
+            },
+            "time_window": {
+                "id": "tw-G3-1",
+                "challenge_deadline_bucket": "deadline-soon",
+            },
+        }))
+
+        assert memories["relation_context"] == {
+            "id": "rel-ctx-1",
+            "relation_id": "rel-alpha-beta",
+            "peer_did": "did:civ:test:peer",
+            "memory_refs": ["failure:prior", "challenge:missing"],
+            "time_window_id": "tw-G3-1",
+            "challenge_deadline_bucket": "deadline-soon",
+        }
+        assert memories["relation_memories"][0] == {
+            "ref": "failure:prior",
+            "key": "failure:prior",
+            "value": {"summary": "peer missed prior challenge"},
+        }
+        assert memories["relation_memories"][1] == {
+            "ref": "challenge:missing",
+            "missing": True,
+        }

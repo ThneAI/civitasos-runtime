@@ -150,7 +150,10 @@ def _subjective_time_prompt_block(subjective: dict[str, Any]) -> str:
         "要求:\n"
         "1) 年轻阶段优先谨慎观察和低风险验证。\n"
         "2) 成熟阶段可以承担稳定协作责任。\n"
-        "3) 无紧急任务时允许进入深度反思，而不是无意义空转。"
+        "3) 无紧急任务时允许进入深度反思，而不是无意义空转。\n"
+        "4) 当没有 active_tasks / urgency 且你决定不调用工具时，"
+        "必须单独输出 `mode_request: waiting` 或 `mode_request: deep_think`；"
+        "不确定或孵化期优先 waiting，需要整理经验时选择 deep_think。"
     )
 
 
@@ -248,6 +251,79 @@ def _parse_llm_mode_request(text: str | None) -> str | None:
     if not match:
         return None
     return _normalize_llm_mode_request(match.group(1))
+
+
+def _text_list(value: Any) -> list[str]:
+    """Normalise a scalar/list memory-ref payload into stable text refs."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"[;,]", value)
+        return [part.strip() for part in parts if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _briefing_relation_context(briefing: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract G.3 relation-memory/time context from a briefing, if present."""
+    relation = briefing.get("relation_context")
+    if not isinstance(relation, dict):
+        relation = briefing.get("g3_relation_context")
+    if not isinstance(relation, dict):
+        return None
+
+    window = briefing.get("time_window")
+    if not isinstance(window, dict):
+        window = briefing.get("g3_time_window")
+    if not isinstance(window, dict):
+        window = {}
+
+    refs = _text_list(relation.get("memory_refs"))
+    if not refs:
+        refs = _text_list(relation.get("relation_memory_refs"))
+
+    context_id = str(
+        relation.get("id")
+        or relation.get("relation_context_id")
+        or relation.get("relation_id")
+        or ""
+    ).strip()
+    relation_id = str(relation.get("relation_id") or context_id).strip()
+    peer_did = str(
+        relation.get("peer_did")
+        or relation.get("peer_id")
+        or relation.get("counterparty_did")
+        or ""
+    ).strip()
+    time_window_id = str(window.get("id") or window.get("time_window_id") or "").strip()
+    deadline_bucket = str(
+        window.get("challenge_deadline_bucket")
+        or relation.get("challenge_deadline_bucket")
+        or ""
+    ).strip()
+
+    out: dict[str, Any] = {
+        "id": context_id,
+        "relation_id": relation_id,
+        "peer_did": peer_did,
+        "memory_refs": refs,
+        "time_window_id": time_window_id,
+        "challenge_deadline_bucket": deadline_bucket,
+    }
+    return {key: value for key, value in out.items() if value not in ("", [], None)}
+
+
+def _relation_memory_candidates(ref: str) -> list[str]:
+    """Keep relation recall compatible with existing flat memory key styles."""
+    candidates = [ref]
+    if not ref.startswith("relation_memory:"):
+        candidates.append(f"relation_memory:{ref}")
+    if not ref.startswith("relation:"):
+        candidates.append(f"relation:{ref}")
+    if not ref.startswith("memory:"):
+        candidates.append(f"memory:{ref}")
+    return candidates
 
 
 # Interval seconds per mode
@@ -631,6 +707,28 @@ class CognitiveLoop:
             if isinstance(trace, list) and trace:
                 memories["identity_trace"] = trace[-10:]
 
+        relation_context = _briefing_relation_context(briefing)
+        if relation_context:
+            memories["relation_context"] = relation_context
+            relation_memories: list[dict[str, Any]] = []
+            for ref in relation_context.get("memory_refs", [])[:10]:
+                value = None
+                resolved_key = None
+                for key in _relation_memory_candidates(str(ref)):
+                    value = _get(key)
+                    if value is not None:
+                        resolved_key = key
+                        break
+                item: dict[str, Any] = {"ref": ref}
+                if value is None:
+                    item["missing"] = True
+                else:
+                    item["key"] = resolved_key or ref
+                    item["value"] = value
+                relation_memories.append(item)
+            if relation_memories:
+                memories["relation_memories"] = relation_memories
+
         # Semantic recall: find similar episodes based on current context
         try:
             context_query = ", ".join(
@@ -736,6 +834,7 @@ class CognitiveLoop:
         ]
         active_task_ids = [tid for tid in active_task_ids if tid]
         has_active = bool(active_task_ids)
+        is_g2_mode_probe = isinstance(briefing.get("benchmark_g2_mode_probe"), dict)
         if has_active:
             signature_lines = [
                 f"- {tid}: {_task_signature_salt(str(tid))}"
@@ -753,11 +852,16 @@ class CognitiveLoop:
                 f"{chr(10).join(signature_lines)}"
             )
 
-        user_content_tail = (
-            "请立即调用 task_execute 工具完成上述已认领任务。"
-            if has_active
-            else "请分析当前状态，决定下一步行动。调用合适的工具，或回复 \"wait\"。"
-        )
+        if has_active:
+            user_content_tail = "请立即调用 task_execute 工具完成上述已认领任务。"
+        elif is_g2_mode_probe:
+            user_content_tail = (
+                "这是 G.2 主观时间模式选择 probe：当前没有可领取的 backend task，"
+                "不要调用任何工具。请只输出一行：`mode_request: waiting` 或 "
+                "`mode_request: deep_think`。"
+            )
+        else:
+            user_content_tail = "请分析当前状态，决定下一步行动。调用合适的工具，或回复 \"wait\"。"
         user_content = (
             f"当前简报:\n{json.dumps(briefing, indent=2, ensure_ascii=False, default=str)}\n\n"
             f"记忆上下文:\n{json.dumps(memories, indent=2, ensure_ascii=False, default=str)}\n\n"
@@ -834,6 +938,12 @@ class CognitiveLoop:
             )
 
         mode_request = _parse_llm_mode_request(response.content)
+        if not mode_request and is_g2_mode_probe and response.content:
+            probe_text = response.content.strip().lower().replace("-", "_")
+            if "deep_think" in probe_text or "deep think" in probe_text:
+                mode_request = LoopMode.DEEP_THINK.value
+            elif probe_text == "wait" or "waiting" in probe_text or "wait" in probe_text:
+                mode_request = LoopMode.WAITING.value
         if mode_request:
             return Decision(
                 action="wait",
