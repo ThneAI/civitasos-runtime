@@ -79,6 +79,31 @@ class LocalMemory:
             rows = self._conn.execute("SELECT key FROM kv ORDER BY ts DESC").fetchall()
         return [r[0] for r in rows]
 
+    def weighted_items(
+        self,
+        *,
+        top_k: int = 10,
+        half_life_days: float = 7.0,
+    ) -> list[dict[str, Any]]:
+        """Return local items ranked by exponential time-decay weight."""
+        half_life_days = max(float(half_life_days), 0.001)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value, (julianday('now') - ts) AS age_days "
+                "FROM kv ORDER BY ts DESC"
+            ).fetchall()
+        ranked = []
+        for key, raw, age_days in rows:
+            age = max(float(age_days or 0.0), 0.0)
+            ranked.append({
+                "key": key,
+                "value": json.loads(raw),
+                "age_days": age,
+                "decay_weight": 0.5 ** (age / half_life_days),
+            })
+        ranked.sort(key=lambda item: item["decay_weight"], reverse=True)
+        return ranked[:top_k]
+
     def close(self) -> None:
         self._conn.close()
 
@@ -129,6 +154,15 @@ class HybridMemory:
             except Exception:
                 pass
         return []
+
+    def recall_weighted(
+        self,
+        *,
+        top_k: int = 10,
+        half_life_days: float = 7.0,
+    ) -> list[dict[str, Any]]:
+        """Return local memories ranked by lifecycle-aware time decay."""
+        return self._local.weighted_items(top_k=top_k, half_life_days=half_life_days)
 
     def close(self) -> None:
         self._local.close()

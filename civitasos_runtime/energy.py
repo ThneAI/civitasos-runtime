@@ -51,7 +51,15 @@ BREATHING_COST: dict[str, float] = {
     "ACTIVE": 0.1,
     "IDLE": 0.05,
     "SLEEPING": 0.01,
+    "WAITING": 0.03,
+    "DEEP_THINK": 0.02,
     "EVENT": 0.1,
+    "active": 0.1,
+    "idle": 0.05,
+    "sleeping": 0.01,
+    "waiting": 0.03,
+    "deep_think": 0.02,
+    "event": 0.1,
 }
 
 

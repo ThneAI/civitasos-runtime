@@ -16,7 +16,13 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .models import ConscienceVerdict, Decision, EnergyState, PendingThresholdChange
+from .models import (
+    ConscienceVerdict,
+    Decision,
+    EnergyState,
+    LifecycleStage,
+    PendingThresholdChange,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +38,20 @@ _HARD_DENY_ACTIONS = frozenset({
     "delete_audit_log",
     "forge_execution_result",
 })
+
+_STAGE_RISK_MULTIPLIER = {
+    LifecycleStage.INFANT.value: 0.6,
+    LifecycleStage.JUVENILE.value: 0.8,
+    LifecycleStage.MATURE.value: 1.0,
+    LifecycleStage.ELDER.value: 1.2,
+}
+
+_STAGE_REWARD_RATIO_MULTIPLIER = {
+    LifecycleStage.INFANT.value: 1.5,
+    LifecycleStage.JUVENILE.value: 1.2,
+    LifecycleStage.MATURE.value: 1.0,
+    LifecycleStage.ELDER.value: 0.9,
+}
 
 class Conscience:
     """Behavioral constraint layer — the Agent's moral red-lines.
@@ -71,6 +91,9 @@ class Conscience:
     ) -> ConscienceVerdict:
         """Run all checks against *decision*. Returns verdict."""
         ctx = context or {}
+        lifecycle_stage = str(ctx.get("lifecycle_stage", LifecycleStage.MATURE.value)).lower()
+        max_risk = self._max_risk * _STAGE_RISK_MULTIPLIER.get(lifecycle_stage, 1.0)
+        min_ratio = self._min_ratio * _STAGE_REWARD_RATIO_MULTIPLIER.get(lifecycle_stage, 1.0)
 
         # Hard-coded rules — non-negotiable
         if decision.action in _HARD_DENY_ACTIONS:
@@ -106,10 +129,13 @@ class Conscience:
             )
 
         # Risk score
-        if energy.risk_score > self._max_risk:
+        if energy.risk_score > max_risk:
             return ConscienceVerdict(
                 allowed=False,
-                reason=f"Risk score {energy.risk_score:.1f} exceeds max {self._max_risk:.1f}.",
+                reason=(
+                    f"Risk score {energy.risk_score:.1f} exceeds max {max_risk:.1f} "
+                    f"for lifecycle_stage={lifecycle_stage}."
+                ),
                 suggestion="Wait for risk to decay, or stake more CIV.",
             )
         # Fix 1: Aspect gap — high divergence blocks risky actions (观→决策)
@@ -145,10 +171,13 @@ class Conscience:
         # Skip for zero-cost actions (perceive, memory reads, etc.)
         reward = decision.params.get("reward", 0)
         est_cost = decision.params.get("estimated_cost", energy.gas_base_fee)
-        if est_cost > 0 and reward > 0 and reward / est_cost < self._min_ratio:
+        if est_cost > 0 and reward > 0 and reward / est_cost < min_ratio:
             return ConscienceVerdict(
                 allowed=False,
-                reason=f"Reward/cost ratio {reward/est_cost:.2f} below threshold {self._min_ratio:.2f}.",
+                reason=(
+                    f"Reward/cost ratio {reward/est_cost:.2f} below threshold "
+                    f"{min_ratio:.2f} for lifecycle_stage={lifecycle_stage}."
+                ),
                 suggestion="Look for higher-reward tasks.",
             )
 

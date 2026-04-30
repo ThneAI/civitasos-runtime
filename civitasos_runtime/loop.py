@@ -23,11 +23,13 @@ from .models import (
     Decision,
     DecisionSource,
     Evaluation,
+    LifecycleStage,
     LoopMode,
     TickContext,
     TickPhase,
 )
 from .rules import RulesEngine
+from .subjective_time import build_subjective_time
 from .tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -133,6 +135,24 @@ def _institutional_identity_prompt_block(identity: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _subjective_time_prompt_block(subjective: dict[str, Any]) -> str:
+    stage = subjective.get("lifecycle_stage", "unknown")
+    age_days = float(subjective.get("age_seconds", 0.0) or 0.0) / 86400.0
+    mode = subjective.get("recommended_mode", "unknown")
+    half_life = subjective.get("memory_half_life_days", "unknown")
+    return (
+        "\n\nAgent 主观时间:\n"
+        f"- lifecycle_stage: {stage}\n"
+        f"- age_days: {age_days:.2f}\n"
+        f"- recommended_mode: {mode}\n"
+        f"- memory_half_life_days: {half_life}\n"
+        "要求:\n"
+        "1) 年轻阶段优先谨慎观察和低风险验证。\n"
+        "2) 成熟阶段可以承担稳定协作责任。\n"
+        "3) 无紧急任务时允许进入深度反思，而不是无意义空转。"
+    )
+
+
 def _opt_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -207,6 +227,8 @@ _INTERVALS: dict[LoopMode, float] = {
     LoopMode.ACTIVE: 10.0,
     LoopMode.IDLE: 45.0,
     LoopMode.SLEEPING: 300.0,
+    LoopMode.WAITING: 60.0,
+    LoopMode.DEEP_THINK: 120.0,
     LoopMode.EVENT: 0.0,
 }
 
@@ -369,6 +391,11 @@ class CognitiveLoop:
                         # Fix 1+2: 观 + R2R flow into conscience
                         "aspect_gap": self._energy.state.aspect_gap,
                         "peer_trusts": ctx.briefing.get("_peer_trusts", {}),
+                        "lifecycle_stage": (
+                            ctx.briefing.get("subjective_time", {}).get("lifecycle_stage")
+                            if isinstance(ctx.briefing.get("subjective_time"), dict)
+                            else LifecycleStage.MATURE.value
+                        ),
                     },
                 )
                 ctx.conscience_verdict = verdict
@@ -505,6 +532,14 @@ class CognitiveLoop:
             logger.debug("R2R flow health not available")
 
         self._inject_institutional_identity_summary(briefing)
+        subjective_time = build_subjective_time(briefing)
+        briefing["subjective_time"] = {
+            "genesis_time": subjective_time.genesis_time,
+            "age_seconds": subjective_time.age_seconds,
+            "lifecycle_stage": subjective_time.lifecycle_stage.value,
+            "memory_half_life_days": subjective_time.memory_half_life_days,
+            "recommended_mode": subjective_time.recommended_mode.value,
+        }
 
         return briefing
 
@@ -530,6 +565,22 @@ class CognitiveLoop:
         last_tick = _get("last_tick_summary")
         if last_tick:
             memories["last_tick"] = last_tick
+        subjective = briefing.get("subjective_time")
+        if mem is not None and isinstance(subjective, dict):
+            try:
+                memories["time_weighted_memory_keys"] = [
+                    {
+                        "key": item["key"],
+                        "decay_weight": item["decay_weight"],
+                        "age_days": item["age_days"],
+                    }
+                    for item in mem.recall_weighted(
+                        top_k=5,
+                        half_life_days=float(subjective.get("memory_half_life_days") or 7.0),
+                    )
+                ]
+            except Exception:
+                logger.debug("time-weighted local recall failed")
         if self._identity_emergence_enabled:
             profile = _get("identity_profile")
             if profile:
@@ -620,6 +671,9 @@ class CognitiveLoop:
         if isinstance(identity, dict) and identity:
             system += _institutional_identity_prompt_block(identity)
             briefing["_identity_prompt_injected"] = True
+        subjective = briefing.get("subjective_time")
+        if isinstance(subjective, dict) and subjective:
+            system += _subjective_time_prompt_block(subjective)
 
         # Fix 3: 任务交付强制 — 已认领任务必须立即调用 task_execute，禁止 wait。
         # 否则 LLM 倾向反复观望，导致 Claimed 任务永不交付。
@@ -961,7 +1015,17 @@ class CognitiveLoop:
 
         if briefing.get("urgency") or briefing.get("active_tasks"):
             self._mode = LoopMode.ACTIVE
-        elif briefing.get("opportunities"):
+            return
+
+        subjective = briefing.get("subjective_time")
+        if isinstance(subjective, dict):
+            try:
+                self._mode = LoopMode(subjective.get("recommended_mode", LoopMode.IDLE.value))
+                return
+            except ValueError:
+                logger.debug("Unknown subjective recommended mode: %r", subjective)
+
+        if briefing.get("opportunities"):
             self._mode = LoopMode.IDLE
         else:
             self._mode = LoopMode.SLEEPING

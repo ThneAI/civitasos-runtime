@@ -34,7 +34,16 @@ class LoopMode(str, Enum):
     ACTIVE = "active"         # 5-15s interval
     IDLE = "idle"             # 30-60s
     SLEEPING = "sleeping"     # 5-10min
+    WAITING = "waiting"       # cautious observation window
+    DEEP_THINK = "deep_think" # reflective low-frequency cognition
     EVENT = "event"           # instant wakeup
+
+
+class LifecycleStage(str, Enum):
+    INFANT = "infant"
+    JUVENILE = "juvenile"
+    MATURE = "mature"
+    ELDER = "elder"
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +104,16 @@ class EnergyState:
     aspect_gap: float = 0.0
     peer_trust_avg: float = 0.5
     active_relations: int = 0
+
+
+@dataclass
+class SubjectiveTime:
+    """Agent-local interpretation of objective genesis time."""
+    genesis_time: str | None
+    age_seconds: float
+    lifecycle_stage: LifecycleStage
+    memory_half_life_days: float
+    recommended_mode: LoopMode
 
 
 @dataclass
