@@ -7,7 +7,14 @@ from civitasos_runtime.conscience import Conscience
 from civitasos_runtime.energy import Energy
 from civitasos_runtime.loop import CognitiveLoop
 from civitasos_runtime.memory import HybridMemory
-from civitasos_runtime.models import Decision, LifecycleStage, LLMResponse, LoopMode
+from civitasos_runtime.models import (
+    Decision,
+    Evaluation,
+    LifecycleStage,
+    LLMResponse,
+    LoopMode,
+    TickContext,
+)
 from civitasos_runtime.subjective_time import build_subjective_time, rank_time_weighted_memories
 
 
@@ -247,3 +254,32 @@ class TestSubjectiveTime:
             "ref": "challenge:missing",
             "missing": True,
         }
+
+    def test_loop_remembers_relation_context_for_future_recall(self, tmp_path):
+        memory = HybridMemory(agent=None, data_dir=tmp_path)
+        loop = CognitiveLoop(DummyAgent(), llm=DummyLLM(), memory=memory)
+        ctx = TickContext()
+        ctx.briefing = {
+            "relation_context": {
+                "id": "rel-ctx-1",
+                "relation_id": "rel-alpha-beta",
+                "peer_did": "did:civ:test:peer",
+                "memory_refs": ["relation:G01:prior_success"],
+            },
+            "time_window": {
+                "id": "tw-G01",
+                "challenge_deadline_bucket": "soon",
+            },
+        }
+        ctx.decision = Decision(action="task_execute", reasoning="relation-aware delivery")
+        ctx.evaluation = Evaluation(success=True)
+        ctx.reflection = "Used relation memory for peer decision."
+
+        asyncio.run(loop._remember_tick(ctx))
+        stored = memory.recall("relation:G01:prior_success")
+
+        assert stored["action"] == "task_execute"
+        assert stored["success"] is True
+        assert stored["relation_context"]["relation_id"] == "rel-alpha-beta"
+        assert stored["relation_context"]["time_window_id"] == "tw-G01"
+        memory.close()

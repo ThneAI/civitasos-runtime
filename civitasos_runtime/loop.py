@@ -1136,6 +1136,28 @@ class CognitiveLoop:
                     logger.debug("Failed to save %s", key)
 
         _save("last_tick_summary", summary)
+        relation_context = _briefing_relation_context(ctx.briefing)
+        if relation_context:
+            relation_record = {
+                "tick_id": ctx.tick_id,
+                "relation_context": relation_context,
+                "action": ctx.decision.action if ctx.decision else "none",
+                "success": ctx.evaluation.success if ctx.evaluation else None,
+                "reflection": ctx.reflection,
+                "timestamp": getattr(ctx, "timestamp", None),
+            }
+            relation_keys = []
+            context_id = relation_context.get("id")
+            relation_id = relation_context.get("relation_id")
+            if context_id:
+                relation_keys.append(f"relation_memory:{context_id}")
+            if relation_id:
+                relation_keys.append(f"relation_memory:{relation_id}")
+            for ref in relation_context.get("memory_refs", [])[:10]:
+                relation_keys.append(str(ref))
+                relation_keys.append(f"relation_memory:{ref}")
+            for key in dict.fromkeys(k for k in relation_keys if k):
+                _save(key, relation_record)
         if self._identity_emergence_enabled:
             if self._memory is not None:
                 identity_trace = self._memory.recall("identity_trace") or []
