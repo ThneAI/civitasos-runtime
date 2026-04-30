@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from civitasos_runtime.conscience import Conscience
 from civitasos_runtime.energy import Energy
 from civitasos_runtime.loop import CognitiveLoop
 from civitasos_runtime.memory import HybridMemory
-from civitasos_runtime.models import Decision, LifecycleStage, LoopMode
+from civitasos_runtime.models import Decision, LifecycleStage, LLMResponse, LoopMode
 from civitasos_runtime.subjective_time import build_subjective_time
 
 
@@ -26,6 +27,11 @@ class DummyAgent:
 class DummyLLM:
     async def chat(self, *_args, **_kwargs):
         raise AssertionError("LLM should not be called in this test")
+
+
+class ModeRequestLLM:
+    async def chat(self, *_args, **_kwargs):
+        return LLMResponse(content="No safe action now.\nmode_request: deep_think")
 
 
 class TestSubjectiveTime:
@@ -72,6 +78,23 @@ class TestSubjectiveTime:
         })
         assert loop.mode == LoopMode.WAITING
         assert loop.interval == 60.0
+
+    def test_llm_mode_request_updates_subjective_time_and_mode(self):
+        loop = CognitiveLoop(DummyAgent(), llm=ModeRequestLLM())
+        ctx = asyncio.run(loop.tick())
+        subjective = ctx.briefing["subjective_time"]
+        assert ctx.decision is not None
+        assert ctx.decision.params["mode_request"] == "deep_think"
+        assert subjective["llm_mode_request"] == "deep_think"
+        assert subjective["llm_mode_selected"] is True
+        assert loop.mode == LoopMode.DEEP_THINK
+
+    def test_wait_tick_emits_reflect_callback_for_observability(self):
+        loop = CognitiveLoop(DummyAgent(), llm=ModeRequestLLM())
+        seen = []
+        loop.on_reflect(lambda ctx: seen.append(ctx.phase.value))
+        asyncio.run(loop.tick())
+        assert seen == ["reflect"]
 
     def test_conscience_is_more_cautious_for_infant_agents(self):
         conscience = Conscience(max_risk_score=50.0)

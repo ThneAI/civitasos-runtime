@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 from urllib.parse import quote
@@ -222,6 +223,33 @@ def _fallback_output_text(response_content: str | None, task_id: str) -> str:
         return text[:512]
     return f"auto-deliver::{_task_signature_salt(task_id)}"
 
+
+_LLM_MODE_REQUEST_RE = re.compile(
+    r"mode_request\s*[:=]\s*[\"']?(waiting|deep_think)[\"']?",
+    re.IGNORECASE,
+)
+
+
+def _normalize_llm_mode_request(value: Any) -> str | None:
+    """Accept only explicit G.2 autonomous idle-mode choices."""
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("-", "_")
+    if text in {LoopMode.WAITING.value, LoopMode.DEEP_THINK.value}:
+        return text
+    return None
+
+
+def _parse_llm_mode_request(text: str | None) -> str | None:
+    """Parse an explicit `mode_request: waiting|deep_think` from LLM text."""
+    if not text:
+        return None
+    match = _LLM_MODE_REQUEST_RE.search(text)
+    if not match:
+        return None
+    return _normalize_llm_mode_request(match.group(1))
+
+
 # Interval seconds per mode
 _INTERVALS: dict[LoopMode, float] = {
     LoopMode.ACTIVE: 10.0,
@@ -258,6 +286,8 @@ _SYSTEM_TEMPLATE = """\
 
 你可以使用提供的工具与 CivitasOS 交互。
 根据当前简报，决定下一步行动。如果当前无需行动，回复 "wait"。
+G.2 主观时间：当你自主选择等待或深度反思时，必须显式写一行
+`mode_request: waiting` 或 `mode_request: deep_think`，用于观测你对时间模式的选择。
 """
 
 
@@ -370,6 +400,10 @@ class CognitiveLoop:
                 ctx.decision = ctx.decision or Decision(
                     action="wait", reasoning="No action needed"
                 )
+                self._apply_llm_mode_request(ctx)
+                ctx.phase = TickPhase.REFLECT
+                ctx.reflection = ctx.decision.reasoning or "Waiting by decision."
+                self._emit_reflect_callbacks(ctx)
                 ctx.phase = TickPhase.REMEMBER
                 await self._remember_tick(ctx)
                 self._update_mode(ctx.briefing)
@@ -413,6 +447,8 @@ class CognitiveLoop:
                         f"BLOCKED by conscience: {verdict.reason}. "
                         f"Suggestion: {verdict.suggestion}"
                     )
+                    self._apply_llm_mode_request(ctx)
+                    self._emit_reflect_callbacks(ctx)
                     await self._remember_tick(ctx)
                     return ctx
 
@@ -462,15 +498,13 @@ class CognitiveLoop:
 
             # 7. Reflect
             ctx.phase = TickPhase.REFLECT
+            self._apply_llm_mode_request(ctx)
             ctx.reflection = self._reflect(ctx)
-            for fn in self._on_reflect_fns:
-                try:
-                    fn(ctx)
-                except Exception:
-                    logger.exception("Custom reflect callback failed")
+            self._emit_reflect_callbacks(ctx)
 
             # 8. Remember
             ctx.phase = TickPhase.REMEMBER
+            self._apply_llm_mode_request(ctx)
             await self._remember_tick(ctx)
 
             self._update_mode(ctx.briefing)
@@ -539,6 +573,8 @@ class CognitiveLoop:
             "lifecycle_stage": subjective_time.lifecycle_stage.value,
             "memory_half_life_days": subjective_time.memory_half_life_days,
             "recommended_mode": subjective_time.recommended_mode.value,
+            "llm_mode_request": None,
+            "llm_mode_selected": False,
         }
 
         return briefing
@@ -737,6 +773,10 @@ class CognitiveLoop:
             # 归一化工具名：去掉 LLM 幻觉的命名空间前缀（如 "task_executor:task_execute"）
             tool_name = tc.name.split(":")[-1] if ":" in tc.name else tc.name
             tool_args = dict(tc.arguments or {})
+            mode_request = _normalize_llm_mode_request(tool_args.get("mode_request"))
+            if mode_request:
+                tool_args["mode_request"] = mode_request
+                tool_args["mode_request_source"] = "llm"
 
             # Fix 4: 如果 LLM 选了 task_execute 且我们已认领任务，强制用 briefing 真实
             # task_id + 必填 output/success 覆盖参数（LLM 经常编造 UUID 或漏字段）。
@@ -778,6 +818,18 @@ class CognitiveLoop:
                 source=DecisionSource.LLM,
             )
 
+        mode_request = _parse_llm_mode_request(response.content)
+        if mode_request:
+            return Decision(
+                action="wait",
+                params={
+                    "mode_request": mode_request,
+                    "mode_request_source": "llm",
+                },
+                reasoning=response.content or f"LLM requested {mode_request}",
+                source=DecisionSource.LLM,
+            )
+
         # If text response contains "wait", do nothing
         if response.content and "wait" in response.content.lower():
             return Decision(
@@ -792,6 +844,29 @@ class CognitiveLoop:
             reasoning=response.content or "LLM did not call a tool",
             source=DecisionSource.LLM,
         )
+
+    def _apply_llm_mode_request(self, ctx: TickContext) -> None:
+        """Project an explicit LLM waiting/deep_think choice into briefing state."""
+        decision = ctx.decision
+        params = decision.params if decision else {}
+        mode_request = _normalize_llm_mode_request(params.get("mode_request"))
+        if not mode_request:
+            return
+        subjective = ctx.briefing.setdefault("subjective_time", {})
+        if not isinstance(subjective, dict):
+            subjective = {}
+            ctx.briefing["subjective_time"] = subjective
+        subjective["llm_mode_request"] = mode_request
+        subjective["llm_mode_selected"] = True
+        subjective["recommended_mode"] = mode_request
+
+    def _emit_reflect_callbacks(self, ctx: TickContext) -> None:
+        """Notify observers once a tick has a reflect-phase snapshot."""
+        for fn in self._on_reflect_fns:
+            try:
+                fn(ctx)
+            except Exception:
+                logger.exception("Custom reflect callback failed")
 
     def _update_local_aspect_gap_from_tick(self, ctx: TickContext) -> None:
         """Update aspect_gap from local evidence when remote R2R data is missing.
