@@ -155,6 +155,15 @@ class SubjectiveTime:
 
 
 @dataclass
+class IEMVersionAnchor:
+    """DID/Identity-facing anchor for the latest Identity Expectation Model."""
+    version_id: str
+    state_hash: str
+    latest_update_log_hash: str
+    storage_hint: str
+
+
+@dataclass
 class ExpectationTrace:
     """A single reality/expectation comparison for H.0 observability."""
     domain: ExpectationDomain

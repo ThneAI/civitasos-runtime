@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 from .conscience import Conscience
 from .energy import Energy
+from .iem_anchor import build_iem_anchor, genesis_iem_state
 from .llm import LLMAdapter
 from .memory import HybridMemory
 from .models import (
@@ -1009,6 +1010,27 @@ class CognitiveLoop:
             return self._agent.recall(key)
 
         try:
+            iem_state = _recall("identity_iem_state")
+        except Exception:
+            iem_state = None
+        if not isinstance(iem_state, dict):
+            iem_state = genesis_iem_state(str(agent_id))
+        try:
+            update_log = _recall("expectation_update_log")
+        except Exception:
+            update_log = None
+        if not isinstance(update_log, list):
+            update_log = []
+        anchor = build_iem_anchor(
+            identity_id=str(agent_id),
+            state=iem_state,
+            update_log=update_log,
+        )
+        anchor_payload = _jsonable(anchor)
+        ctx.expectations["identity_iem_anchor"] = anchor_payload
+        ctx.briefing["iem_anchor"] = anchor_payload
+
+        try:
             apply_relation_matrix_expectation(
                 ctx,
                 local_identity=str(agent_id),
@@ -1168,6 +1190,12 @@ class CognitiveLoop:
                     logger.debug("Failed to save %s", key)
 
         _save("last_tick_summary", summary)
+        agent_id = (
+            getattr(self._agent, "agent_id", None)
+            or getattr(self._agent, "_agent_id", None)
+            or ""
+        )
+        relation_expectations: Any = {}
         relation_context = _briefing_relation_context(ctx.briefing)
         if relation_context:
             relation_expectations = _jsonable(ctx.expectations.get("relation", {}))
@@ -1209,6 +1237,12 @@ class CognitiveLoop:
             if isinstance(relation_expectations, dict):
                 for key, value in relation_expectations.items():
                     _save(f"relation_expectation:{key}", value)
+        self._remember_iem_anchor(
+            ctx,
+            identity_id=str(agent_id),
+            relation_expectations=relation_expectations,
+            save=_save,
+        )
         if self._identity_emergence_enabled:
             if self._memory is not None:
                 identity_trace = self._memory.recall("identity_trace") or []
@@ -1265,6 +1299,59 @@ class CognitiveLoop:
                 })
                 lessons = lessons[-20:]
                 _save("lessons_learned", lessons)
+
+    def _remember_iem_anchor(
+        self,
+        ctx: TickContext,
+        *,
+        identity_id: str,
+        relation_expectations: Any,
+        save,
+    ) -> None:
+        """Persist the Identity-owned IEM state and version anchor."""
+        if self._memory is not None:
+            prior_state = self._memory.recall("identity_iem_state")
+            prior_update_log = self._memory.recall("expectation_update_log")
+        else:
+            try:
+                prior_state = self._agent.recall("identity_iem_state")
+            except Exception:
+                prior_state = None
+            try:
+                prior_update_log = self._agent.recall("expectation_update_log")
+            except Exception:
+                prior_update_log = None
+        if not isinstance(prior_state, dict):
+            prior_state = genesis_iem_state(identity_id)
+        if not isinstance(prior_update_log, list):
+            prior_update_log = []
+
+        update_entries = [_jsonable(update) for update in ctx.expectation_updates]
+        update_log = [*prior_update_log, *update_entries]
+        save("expectation_update_log", update_log)
+
+        relation_matrix = prior_state.get("relation_expectation_matrix")
+        if not isinstance(relation_matrix, dict):
+            relation_matrix = {}
+        if isinstance(relation_expectations, dict):
+            relation_matrix.update(relation_expectations)
+
+        iem_state = dict(prior_state)
+        iem_state["schema_version"] = iem_state.get("schema_version") or "iem:v1"
+        iem_state["identity_id"] = identity_id or iem_state.get("identity_id") or "unknown"
+        iem_state["relation_expectation_matrix"] = relation_matrix
+        iem_state["last_tick_id"] = ctx.tick_id
+
+        anchor = build_iem_anchor(
+            identity_id=identity_id,
+            state=iem_state,
+            update_log=update_log,
+        )
+        anchor_payload = _jsonable(anchor)
+        save("identity_iem_state", iem_state)
+        save("identity_iem_anchor", anchor_payload)
+        ctx.expectations["identity_iem_anchor"] = anchor_payload
+        ctx.briefing["iem_anchor"] = anchor_payload
 
     def _update_mode(self, briefing: dict[str, Any]) -> None:
         """Auto-adjust loop mode based on briefing signals and economic state.

@@ -18,6 +18,7 @@ For embedding mode (single tick):
 from .conscience import Conscience
 from .energy import Energy
 from .gateway import CallRecord, CivitasGateway, GatewayConfig, Ledger
+from .iem_anchor import build_iem_anchor, genesis_iem_state, iem_state_hash, iem_update_log_hash
 from .llm import (
     AnthropicAdapter,
     LiteLLMAdapter,
@@ -33,6 +34,7 @@ from .models import (
     DecisionSource,
     EnergyState,
     Evaluation,
+    IEMVersionAnchor,
     LifecycleStage,
     LLMResponse,
     LoopMode,
@@ -68,6 +70,10 @@ __all__ = [
     # Memory
     "HybridMemory",
     "LocalMemory",
+    "build_iem_anchor",
+    "genesis_iem_state",
+    "iem_state_hash",
+    "iem_update_log_hash",
     # LLM
     "LLMAdapter",
     "OpenAIAdapter",
@@ -82,6 +88,7 @@ __all__ = [
     "ConscienceVerdict",
     "EnergyState",
     "PendingThresholdChange",
+    "IEMVersionAnchor",
     "DirectedRelationExpectation",
     "RelationExpectationVector",
     "LifecycleStage",

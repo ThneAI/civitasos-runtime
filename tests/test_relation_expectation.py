@@ -172,6 +172,17 @@ def test_loop_runs_relation_expectation_before_decide_and_persists_matrix() -> N
     saved = agent.saved[f"relation_expectation:{key}"]
     assert isinstance(saved, dict)
     assert saved["relation_id"] == RELATION_ID
+    assert "expectation_update_log" in agent.saved
+    assert "identity_iem_state" in agent.saved
+    assert "identity_iem_anchor" in agent.saved
+    anchor = agent.saved["identity_iem_anchor"]
+    assert isinstance(anchor, dict)
+    assert anchor["version_id"].startswith("iem:v1:")
+    assert anchor["state_hash"].startswith("sha256:")
+    assert anchor["latest_update_log_hash"].startswith("sha256:")
+    assert ctx.briefing["iem_anchor"] == anchor
+    state = agent.saved["identity_iem_state"]
+    assert key in state["relation_expectation_matrix"]
 
 
 def test_on_perceive_hook_can_feed_relation_context_to_expect_phase() -> None:
