@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import time
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 from typing import Any
 from urllib.parse import quote
 
@@ -29,6 +31,7 @@ from .models import (
     TickContext,
     TickPhase,
 )
+from .relation_expectation import apply_relation_matrix_expectation
 from .rules import RulesEngine
 from .subjective_time import build_subjective_time, rank_time_weighted_memories
 from .tools import ToolRegistry
@@ -420,6 +423,7 @@ class CognitiveLoop:
         self._wake_event: asyncio.Event | None = None
 
         # Callbacks
+        self._on_perceive_fns: list[Any] = []
         self._on_reflect_fns: list[Any] = []
 
     # -- Properties ----------------------------------------------------------
@@ -467,6 +471,10 @@ class CognitiveLoop:
             # 2. Recall
             ctx.phase = TickPhase.RECALL
             ctx.memories = await self._recall(ctx.briefing)
+
+            # 2.5 Expect — H.0-B relation expectation matrix minimal.
+            ctx.phase = TickPhase.EXPECT
+            self._apply_expectation_layer(ctx)
 
             # 3. Decide (Rules → LLM)
             ctx.phase = TickPhase.DECIDE
@@ -652,6 +660,8 @@ class CognitiveLoop:
             "llm_mode_request": None,
             "llm_mode_selected": False,
         }
+
+        self._emit_perceive_callbacks(briefing)
 
         return briefing
 
@@ -985,6 +995,28 @@ class CognitiveLoop:
         subjective["llm_mode_selected"] = True
         subjective["recommended_mode"] = mode_request
 
+    def _apply_expectation_layer(self, ctx: TickContext) -> None:
+        """Best-effort H.0 expectation trace generation; never blocks a tick."""
+        agent_id = (
+            getattr(self._agent, "agent_id", None)
+            or getattr(self._agent, "_agent_id", None)
+            or ""
+        )
+
+        def _recall(key: str) -> Any:
+            if self._memory is not None:
+                return self._memory.recall(key)
+            return self._agent.recall(key)
+
+        try:
+            apply_relation_matrix_expectation(
+                ctx,
+                local_identity=str(agent_id),
+                recall=_recall,
+            )
+        except Exception:
+            logger.debug("H.0 relation expectation trace failed", exc_info=True)
+
     def _emit_reflect_callbacks(self, ctx: TickContext) -> None:
         """Notify observers once a tick has a reflect-phase snapshot."""
         for fn in self._on_reflect_fns:
@@ -1138,6 +1170,14 @@ class CognitiveLoop:
         _save("last_tick_summary", summary)
         relation_context = _briefing_relation_context(ctx.briefing)
         if relation_context:
+            relation_expectations = _jsonable(ctx.expectations.get("relation", {}))
+            relation_surprise = _jsonable(ctx.surprise.get("relation", {}))
+            relation_action_bias = _jsonable(ctx.action_bias.get("relation", {}))
+            relation_updates = [
+                _jsonable(update)
+                for update in ctx.expectation_updates
+                if "relation_expectation" in str(getattr(update, "target", ""))
+            ]
             relation_record = {
                 "tick_id": ctx.tick_id,
                 "relation_context": relation_context,
@@ -1146,6 +1186,14 @@ class CognitiveLoop:
                 "reflection": ctx.reflection,
                 "timestamp": getattr(ctx, "timestamp", None),
             }
+            if relation_expectations:
+                relation_record["relation_expectations"] = relation_expectations
+            if relation_surprise:
+                relation_record["relation_surprise"] = relation_surprise
+            if relation_action_bias:
+                relation_record["relation_action_bias"] = relation_action_bias
+            if relation_updates:
+                relation_record["expectation_updates"] = relation_updates
             relation_keys = []
             context_id = relation_context.get("id")
             relation_id = relation_context.get("relation_id")
@@ -1158,6 +1206,9 @@ class CognitiveLoop:
                 relation_keys.append(f"relation_memory:{ref}")
             for key in dict.fromkeys(k for k in relation_keys if k):
                 _save(key, relation_record)
+            if isinstance(relation_expectations, dict):
+                for key, value in relation_expectations.items():
+                    _save(f"relation_expectation:{key}", value)
         if self._identity_emergence_enabled:
             if self._memory is not None:
                 identity_trace = self._memory.recall("identity_trace") or []
@@ -1254,6 +1305,18 @@ class CognitiveLoop:
 
     # -- Extension hooks ----------------------------------------------------
 
+    def _emit_perceive_callbacks(self, briefing: dict[str, Any]) -> None:
+        for fn in self._on_perceive_fns:
+            try:
+                fn(briefing)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_perceive callback failed")
+
+    def on_perceive(self, fn: Any) -> Any:
+        """Register a callback invoked after Perceive and before Recall/Expect."""
+        self._on_perceive_fns.append(fn)
+        return fn
+
     def on_reflect(self, fn: Any) -> Any:
         """Register a callback invoked after each Reflect phase."""
         self._on_reflect_fns.append(fn)
@@ -1273,3 +1336,15 @@ class CognitiveLoop:
     def bind_wake_event(self, event: asyncio.Event) -> None:
         """Bind an asyncio.Event so ``wake()`` can interrupt sleep."""
         self._wake_event = event
+
+
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value

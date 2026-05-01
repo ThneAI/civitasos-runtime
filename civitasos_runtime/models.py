@@ -22,6 +22,7 @@ class DecisionSource(str, Enum):
 class TickPhase(str, Enum):
     PERCEIVE = "perceive"
     RECALL = "recall"
+    EXPECT = "expect"
     DECIDE = "decide"
     CONSCIENCE = "conscience"
     ACT = "act"
@@ -44,6 +45,43 @@ class LifecycleStage(str, Enum):
     JUVENILE = "juvenile"
     MATURE = "mature"
     ELDER = "elder"
+
+
+class ExpectationDomain(str, Enum):
+    SURVIVAL = "survival"
+    ECONOMIC = "economic"
+    REPUTATION = "reputation"
+    RELATION = "relation"
+    TASK = "task"
+    GOVERNANCE = "governance"
+    CONSTITUTIONAL = "constitutional"
+
+
+class ExpectationStateKind(str, Enum):
+    PREDICTED = "predicted"
+    DESIRED = "desired"
+    NORMATIVE = "normative"
+
+
+class ExpectationUpdateRule(str, Enum):
+    EMA = "EMA"
+    PRECISION_WEIGHTED_DELTA = "precision_weighted_delta"
+    SLOW_TRAIT_DRIFT = "slow_trait_drift"
+    RELATION_MATRIX_UPDATE = "relation_matrix_update"
+    DECAY = "decay"
+    GOVERNANCE_TRIGGER = "governance_trigger"
+    GOVERNED_REVISION = "governed_revision"
+
+
+class ExpectationLifecycleState(str, Enum):
+    CREATED = "created"
+    ACTIVE = "active"
+    CONFIRMED = "confirmed"
+    VIOLATED = "violated"
+    REVISED = "revised"
+    DECAYED = "decayed"
+    INSTITUTIONALIZED = "institutionalized"
+    DEPRECATED = "deprecated"
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +155,70 @@ class SubjectiveTime:
 
 
 @dataclass
+class ExpectationTrace:
+    """A single reality/expectation comparison for H.0 observability."""
+    domain: ExpectationDomain
+    state_kind: ExpectationStateKind
+    expected_value: float | None = None
+    actual_value: float | None = None
+    surprise_score: float | None = None
+    precision: float | None = None
+    valence: str = ""
+    stake: float | None = None
+    source_event_id: str = ""
+    lifecycle_state: ExpectationLifecycleState = ExpectationLifecycleState.ACTIVE
+
+
+@dataclass
+class DriveTrace:
+    """Drive is action pressure, not permission."""
+    domain: ExpectationDomain
+    drive_score: float | None = None
+    actionability: float | None = None
+    action_bias: str = ""
+    constitution_verdict: str = ""
+
+
+@dataclass
+class ExpectationUpdate:
+    """Auditable candidate or applied update for Identity-owned IEM state."""
+    target: str
+    parameter_name: str
+    old_value: float | str | None = None
+    new_value: float | str | None = None
+    rule: ExpectationUpdateRule = ExpectationUpdateRule.PRECISION_WEIGHTED_DELTA
+    reason_event: str = ""
+    update_params: dict[str, Any] = field(default_factory=dict)
+    constitution_verdict: str = ""
+    local_update_blocked: bool = False
+
+
+@dataclass
+class RelationExpectationVector:
+    """Minimal directed relation expectation vector for H.0-B."""
+    expected_trust: float = 0.72
+    expected_delivery_quality: float = 0.72
+    expected_cooperation: float = 0.70
+    expected_betrayal_risk: float = 0.12
+    expected_repair_probability: float = 0.55
+    precision: float = 0.35
+
+
+@dataclass
+class DirectedRelationExpectation:
+    """Expectation owned by one identity about one counterparty relation edge."""
+    relation_id: str
+    from_identity: str
+    to_identity: str
+    state_kind: ExpectationStateKind = ExpectationStateKind.PREDICTED
+    expectation: RelationExpectationVector = field(default_factory=RelationExpectationVector)
+    source_event_ids: list[str] = field(default_factory=list)
+    updated_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+@dataclass
 class TickContext:
     """Per-tick data flowing through the cognitive loop."""
     tick_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -125,6 +227,11 @@ class TickContext:
     )
     briefing: dict[str, Any] = field(default_factory=dict)
     memories: dict[str, Any] = field(default_factory=dict)
+    expectations: dict[str, Any] = field(default_factory=dict)
+    surprise: dict[str, Any] = field(default_factory=dict)
+    drive: dict[str, Any] = field(default_factory=dict)
+    action_bias: dict[str, Any] = field(default_factory=dict)
+    expectation_updates: list[ExpectationUpdate] = field(default_factory=list)
     decision: Decision | None = None
     conscience_verdict: ConscienceVerdict | None = None
     action_result: Any = None

@@ -130,6 +130,13 @@ class AgentRunner:
         self._on_reflect_fn = fn
         return fn
 
+    def on_perceive(self, fn: Callable) -> Callable:
+        """Decorator to register a post-perceive, pre-recall/expect callback."""
+        callbacks = getattr(self, "_on_perceive_fns", [])
+        callbacks.append(fn)
+        self._on_perceive_fns = callbacks
+        return fn
+
     # -- Lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
@@ -174,6 +181,8 @@ class AgentRunner:
         # Forward on_reflect if registered
         if hasattr(self, "_on_reflect_fn"):
             self._loop.on_reflect(self._on_reflect_fn)
+        for fn in getattr(self, "_on_perceive_fns", []):
+            self._loop.on_perceive(fn)
 
         # 6. Install signal handlers for graceful shutdown
         for sig in (signal.SIGINT, signal.SIGTERM):
