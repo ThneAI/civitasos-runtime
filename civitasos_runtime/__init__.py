@@ -19,6 +19,7 @@ from .conscience import Conscience
 from .energy import Energy
 from .gateway import CallRecord, CivitasGateway, GatewayConfig, Ledger
 from .iem_anchor import build_iem_anchor, genesis_iem_state, iem_state_hash, iem_update_log_hash
+from .identity_expectation import apply_identity_expectation_traces, apply_iem_updates_to_state
 from .llm import (
     AnthropicAdapter,
     LiteLLMAdapter,
@@ -74,6 +75,8 @@ __all__ = [
     "genesis_iem_state",
     "iem_state_hash",
     "iem_update_log_hash",
+    "apply_identity_expectation_traces",
+    "apply_iem_updates_to_state",
     # LLM
     "LLMAdapter",
     "OpenAIAdapter",

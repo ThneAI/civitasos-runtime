@@ -21,6 +21,7 @@ from urllib.parse import quote
 from .conscience import Conscience
 from .energy import Energy
 from .iem_anchor import build_iem_anchor, genesis_iem_state
+from .identity_expectation import apply_identity_expectation_traces, apply_iem_updates_to_state
 from .llm import LLMAdapter
 from .memory import HybridMemory
 from .models import (
@@ -1031,6 +1032,15 @@ class CognitiveLoop:
         ctx.briefing["iem_anchor"] = anchor_payload
 
         try:
+            apply_identity_expectation_traces(
+                ctx,
+                energy_state=self._energy.state,
+                iem_state=iem_state,
+            )
+        except Exception:
+            logger.debug("H.0 identity expectation trace failed", exc_info=True)
+
+        try:
             apply_relation_matrix_expectation(
                 ctx,
                 local_identity=str(agent_id),
@@ -1336,7 +1346,7 @@ class CognitiveLoop:
         if isinstance(relation_expectations, dict):
             relation_matrix.update(relation_expectations)
 
-        iem_state = dict(prior_state)
+        iem_state = apply_iem_updates_to_state(dict(prior_state), update_entries)
         iem_state["schema_version"] = iem_state.get("schema_version") or "iem:v1"
         iem_state["identity_id"] = identity_id or iem_state.get("identity_id") or "unknown"
         iem_state["relation_expectation_matrix"] = relation_matrix
