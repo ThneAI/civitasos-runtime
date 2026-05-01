@@ -1,4 +1,4 @@
-"""H0-C identity-level expectation traces and minimal evolution rules."""
+"""H.0 identity-level expectation traces and minimal evolution rules."""
 
 from __future__ import annotations
 
@@ -23,9 +23,9 @@ def apply_identity_expectation_traces(
     energy_state: EnergyState,
     iem_state: dict[str, Any],
 ) -> bool:
-    """Populate survival/economic/normative expectation traces.
+    """Populate identity-level expectation traces.
 
-    This path makes H0-C useful beyond relation-only evidence while keeping
+    This path makes H.0 useful beyond relation-only evidence while keeping
     Drive as action bias and keeping Normative state governance-owned.
     """
     emitted = False
@@ -50,6 +50,39 @@ def apply_identity_expectation_traces(
         stake=1.0,
         negative_bias="conserve_energy",
         positive_bias="maintain_economic_posture",
+    )
+    emitted |= _apply_predicted_scalar(
+        ctx,
+        iem_state=iem_state,
+        domain=ExpectationDomain.REPUTATION,
+        parameter="reputation_score",
+        expected_default=0.65,
+        actual_value=_reputation_actual(ctx.briefing, energy_state),
+        stake=_reputation_stake(ctx.briefing),
+        negative_bias="repair_reputation",
+        positive_bias="maintain_reputation_posture",
+    )
+    emitted |= _apply_predicted_scalar(
+        ctx,
+        iem_state=iem_state,
+        domain=ExpectationDomain.TASK,
+        parameter="task_success_probability",
+        expected_default=0.75,
+        actual_value=_task_actual(ctx.briefing),
+        stake=_task_stake(ctx.briefing),
+        negative_bias="reduce_task_risk",
+        positive_bias="maintain_task_posture",
+    )
+    emitted |= _apply_predicted_scalar(
+        ctx,
+        iem_state=iem_state,
+        domain=ExpectationDomain.GOVERNANCE,
+        parameter="governance_participation",
+        expected_default=0.60,
+        actual_value=_governance_actual(ctx.briefing),
+        stake=_governance_stake(ctx.briefing),
+        negative_bias="increase_governance_attention",
+        positive_bias="maintain_governance_posture",
     )
     emitted |= _apply_normative_guard(ctx)
     _apply_desired_slow_drift(ctx, iem_state=iem_state)
@@ -122,7 +155,7 @@ def _apply_predicted_scalar(
         precision=round(precision, 4),
         valence=valence,
         stake=round(stake, 4),
-        source_event_id=f"h0c:{domain.value}:{ctx.tick_id}",
+        source_event_id=f"h0:{domain.value}:{ctx.tick_id}",
         lifecycle_state=lifecycle,
     )
     domain_key = domain.value
@@ -238,7 +271,7 @@ def _apply_desired_slow_drift(ctx: TickContext, *, iem_state: dict[str, Any]) ->
             old_value=float(prior_streak),
             new_value=float(next_streak),
             rule=ExpectationUpdateRule.DECAY,
-            reason_event=f"h0c:drift:{ctx.tick_id}",
+            reason_event=f"h0:drift:{ctx.tick_id}",
             update_params={"negative_pressure": negative_pressure},
             constitution_verdict="allowed: drift counter update",
         )
@@ -256,7 +289,7 @@ def _apply_desired_slow_drift(ctx: TickContext, *, iem_state: dict[str, Any]) ->
             old_value=round(current, 4),
             new_value=next_value,
             rule=ExpectationUpdateRule.SLOW_TRAIT_DRIFT,
-            reason_event=f"h0c:repeated_negative_pressure:{ctx.tick_id}",
+            reason_event=f"h0:repeated_negative_pressure:{ctx.tick_id}",
             update_params={
                 "prior_negative_pressure_streak": prior_streak,
                 "learning_rate": learning_rate,
@@ -298,8 +331,88 @@ def _economic_actual(energy_state: EnergyState) -> float:
     return _clamp(float(energy_state.balance) / cap)
 
 
+def _reputation_actual(briefing: dict[str, Any], energy_state: EnergyState) -> float:
+    context = briefing.get("reputation_context")
+    if not isinstance(context, dict):
+        context = briefing.get("reputation")
+    if isinstance(context, dict):
+        for key in ("actual_score", "score", "current_score", "trust_score"):
+            if key in context:
+                return _clamp(_float(context.get(key), 0.5))
+        recent_failures = _float(context.get("recent_failures"), 0.0)
+        unresolved_challenges = _float(context.get("unresolved_challenges"), 0.0)
+        repair_signal = _float(context.get("repair_signal"), 0.0)
+        if recent_failures or unresolved_challenges or repair_signal:
+            return _clamp(
+                0.65 - 0.20 * recent_failures - 0.15 * unresolved_challenges + 0.10 * repair_signal
+            )
+    return _clamp(float(getattr(energy_state, "reputation", 0.5)))
+
+
+def _reputation_stake(briefing: dict[str, Any]) -> float:
+    context = briefing.get("reputation_context")
+    if isinstance(context, dict):
+        return _clamp(_float(context.get("stake"), 0.8))
+    return 0.7
+
+
+def _task_actual(briefing: dict[str, Any]) -> float:
+    context = briefing.get("task_context")
+    if not isinstance(context, dict):
+        context = briefing.get("task")
+    if isinstance(context, dict):
+        for key in (
+            "actual_success_probability",
+            "success_probability",
+            "completion_probability",
+            "quality_score",
+        ):
+            if key in context:
+                return _clamp(_float(context.get(key), 0.5))
+        if bool(context.get("failed")):
+            return 0.10
+        if bool(context.get("blocked")):
+            return 0.25
+        if bool(context.get("delivered")) or bool(context.get("completed")):
+            return 0.90
+        overdue = _float(context.get("overdue"), 0.0)
+        missing_inputs = _float(context.get("missing_inputs"), 0.0)
+        if overdue or missing_inputs:
+            return _clamp(0.70 - 0.25 * overdue - 0.15 * missing_inputs)
+    return 0.75
+
+
+def _task_stake(briefing: dict[str, Any]) -> float:
+    context = briefing.get("task_context")
+    if isinstance(context, dict):
+        return _clamp(_float(context.get("stake"), 0.8))
+    return 0.7
+
+
+def _governance_actual(briefing: dict[str, Any]) -> float:
+    context = briefing.get("governance_context")
+    if not isinstance(context, dict):
+        context = briefing.get("governance")
+    if isinstance(context, dict):
+        for key in ("actual_participation", "participation", "participation_rate", "responsiveness"):
+            if key in context:
+                return _clamp(_float(context.get(key), 0.5))
+        pending_votes = _float(context.get("pending_votes"), 0.0)
+        missed_reviews = _float(context.get("missed_reviews"), 0.0)
+        if pending_votes or missed_reviews:
+            return _clamp(0.65 - 0.15 * pending_votes - 0.20 * missed_reviews)
+    return 0.60
+
+
+def _governance_stake(briefing: dict[str, Any]) -> float:
+    context = briefing.get("governance_context")
+    if isinstance(context, dict):
+        return _clamp(_float(context.get("stake"), 0.9))
+    return 0.8
+
+
 def _has_negative_pressure(ctx: TickContext) -> bool:
-    for domain in ("survival", "economic", "constitutional"):
+    for domain in ("survival", "economic", "reputation", "task", "governance", "constitutional"):
         payload = ctx.surprise.get(domain)
         if not isinstance(payload, dict):
             continue
