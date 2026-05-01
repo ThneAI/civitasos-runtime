@@ -121,3 +121,70 @@ def test_iem_replay_applies_non_normative_updates_only() -> None:
     assert replayed["expectation_vector"]["governance_participation"] <= 0.60
     assert replayed["desire_vector"]["risk_aversion"] > 0.50
     assert "constitution_rule" not in replayed.get("normative_state", {})
+
+
+def test_governed_revision_applies_normative_state_after_approval() -> None:
+    ctx = TickContext(
+        briefing={
+            "governed_revision_context": {
+                "approved": True,
+                "status": "approved",
+                "authority": "governance_council",
+                "source": "backend_governance_read_model",
+                "revision_id": "rev-h0e-1",
+                "rule_id": "challenge_window",
+                "old_value": "v1",
+                "new_value": "v2",
+            },
+        }
+    )
+    state = _iem_state()
+
+    apply_identity_expectation_traces(
+        ctx,
+        energy_state=EnergyState(balance=100.0, balance_cap=100.0),
+        iem_state=state,
+    )
+
+    governed_updates = [
+        update for update in ctx.expectation_updates
+        if update.rule.value == "governed_revision"
+    ]
+    assert len(governed_updates) == 1
+    assert governed_updates[0].local_update_blocked is False
+    assert ctx.action_bias["governance"]["challenge_window"] == "apply_governed_revision"
+
+    update_entries = [
+        {
+            "target": update.target,
+            "parameter_name": update.parameter_name,
+            "new_value": update.new_value,
+            "rule": update.rule.value,
+            "local_update_blocked": update.local_update_blocked,
+        }
+        for update in ctx.expectation_updates
+    ]
+    replayed = apply_iem_updates_to_state(state, update_entries)
+
+    assert replayed["normative_state"]["challenge_window"] == "v2"
+
+
+def test_governed_revision_ignores_unapproved_local_context() -> None:
+    ctx = TickContext(
+        briefing={
+            "governed_revision_context": {
+                "status": "draft",
+                "authority": "local_runtime",
+                "rule_id": "challenge_window",
+                "new_value": "v2",
+            },
+        }
+    )
+
+    apply_identity_expectation_traces(
+        ctx,
+        energy_state=EnergyState(balance=100.0, balance_cap=100.0),
+        iem_state=_iem_state(),
+    )
+
+    assert not any(update.rule.value == "governed_revision" for update in ctx.expectation_updates)

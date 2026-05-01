@@ -85,6 +85,7 @@ def apply_identity_expectation_traces(
         positive_bias="maintain_governance_posture",
     )
     emitted |= _apply_normative_guard(ctx)
+    emitted |= _apply_governed_revision(ctx)
     _apply_desired_slow_drift(ctx, iem_state=iem_state)
     return emitted
 
@@ -101,6 +102,7 @@ def apply_iem_updates_to_state(
         "desire_vector",
         "domain_weight_matrix",
         "drift_parameters",
+        "normative_state",
     ):
         if not isinstance(next_state.get(key), dict):
             next_state[key] = {}
@@ -120,6 +122,8 @@ def apply_iem_updates_to_state(
             next_state["desire_vector"][parameter] = entry.get("new_value")
         elif target == "identity_drift_parameters":
             next_state["drift_parameters"][parameter] = entry.get("new_value")
+        elif target == "normative_state" and _entry_rule(entry) == ExpectationUpdateRule.GOVERNED_REVISION.value:
+            next_state["normative_state"][parameter] = entry.get("new_value")
     return next_state
 
 
@@ -258,6 +262,62 @@ def _apply_normative_guard(ctx: TickContext) -> bool:
         )
     )
     return True
+
+
+def _apply_governed_revision(ctx: TickContext) -> bool:
+    revisions = _governed_revision_entries(ctx.briefing)
+    emitted = False
+    for revision in revisions:
+        if not _revision_is_approved(revision):
+            continue
+        rule_id = str(revision.get("rule_id") or revision.get("id") or "unknown_rule")
+        new_value = revision.get("new_value")
+        if new_value is None:
+            new_value = revision.get("value")
+        if new_value is None:
+            continue
+        old_value = revision.get("old_value", "governance_owned")
+        revision_id = str(
+            revision.get("revision_id")
+            or revision.get("decision_id")
+            or revision.get("proposal_id")
+            or f"governed_revision:{rule_id}:{ctx.tick_id}"
+        )
+        authority = str(revision.get("authority") or revision.get("source") or "governance")
+        ctx.expectations.setdefault("normative_revision", {})[rule_id] = {
+            "state_kind": ExpectationStateKind.NORMATIVE.value,
+            "lifecycle_state": ExpectationLifecycleState.REVISED.value,
+            "revision_id": revision_id,
+            "authority": authority,
+            "source": revision.get("source", "governed_revision_read_model"),
+        }
+        ctx.action_bias.setdefault("governance", {})[rule_id] = "apply_governed_revision"
+        ctx.drive.setdefault("governance", {})[rule_id] = {
+            "drive_score": 0.0,
+            "actionability": 1.0,
+            "action_bias": "apply_governed_revision",
+            "constitution_verdict": "approved: normative state revision is governance-owned",
+        }
+        ctx.expectation_updates.append(
+            ExpectationUpdate(
+                target="normative_state",
+                parameter_name=rule_id,
+                old_value=old_value,
+                new_value=new_value,
+                rule=ExpectationUpdateRule.GOVERNED_REVISION,
+                reason_event=revision_id,
+                update_params={
+                    "domain": "constitutional",
+                    "rule_id": rule_id,
+                    "authority": authority,
+                    "status": revision.get("status", "approved"),
+                },
+                constitution_verdict="approved: governed revision read model",
+                local_update_blocked=False,
+            )
+        )
+        emitted = True
+    return emitted
 
 
 def _apply_desired_slow_drift(ctx: TickContext, *, iem_state: dict[str, Any]) -> None:
@@ -421,6 +481,35 @@ def _has_negative_pressure(ctx: TickContext) -> bool:
                 if _float(item.get("surprise_score"), 0.0) > 0.05:
                     return True
     return False
+
+
+def _governed_revision_entries(briefing: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = briefing.get("governed_revision_context")
+    if raw is None:
+        raw = briefing.get("normative_revision_context")
+    if raw is None:
+        raw = briefing.get("governed_revisions")
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return []
+
+
+def _revision_is_approved(revision: dict[str, Any]) -> bool:
+    status = str(revision.get("status") or "").strip().lower()
+    approved = bool(revision.get("approved")) or status in {"approved", "ratified", "enacted"}
+    authority = str(revision.get("authority") or revision.get("source") or "").strip().lower()
+    governed_authority = any(
+        token in authority
+        for token in ("governance", "arbitration", "constitution", "council")
+    )
+    return approved and governed_authority
+
+
+def _entry_rule(entry: dict[str, Any]) -> str:
+    rule = entry.get("rule")
+    return str(getattr(rule, "value", rule) or "")
 
 
 def _vector_value(state: dict[str, Any], section: str, parameter: str, default: float) -> float:
