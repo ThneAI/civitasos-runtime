@@ -36,6 +36,7 @@ from .models import (
 from .relation_expectation import apply_relation_matrix_expectation
 from .rules import RulesEngine
 from .subjective_time import build_subjective_time, rank_time_weighted_memories
+from .telos import build_telos_alignment, served_intent_layer_for_action
 from .tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,35 @@ def _subjective_time_prompt_block(subjective: dict[str, Any]) -> str:
         "必须单独输出 `mode_request: waiting` 或 `mode_request: deep_think`；"
         "不确定或孵化期优先 waiting，需要整理经验时选择 deep_think。"
     )
+
+
+def _telos_prompt_block(alignment: dict[str, Any]) -> str:
+    stack = alignment.get("intent_stack") if isinstance(alignment, dict) else None
+    if not isinstance(stack, list) or not stack:
+        return ""
+    lines = ["\n\nH.1 Telos / Verifier 对齐:"]
+    for frame in stack:
+        if not isinstance(frame, dict):
+            continue
+        layer = frame.get("layer", "")
+        intent = frame.get("intent", "")
+        if layer and intent:
+            lines.append(f"- {layer}: {intent}")
+    verifier = alignment.get("verification_plan") if isinstance(alignment, dict) else None
+    if isinstance(verifier, dict):
+        tools = verifier.get("tools") or []
+        reasons = verifier.get("reasons") or []
+        lines.extend(
+            [
+                "Verifier:",
+                f"- required: {bool(verifier.get('required'))}",
+                f"- level: {verifier.get('level', 'baseline')}",
+                f"- tools: {', '.join(str(t) for t in tools) if tools else 'none'}",
+                f"- reasons: {', '.join(str(r) for r in reasons) if reasons else 'none'}",
+                "要求: 每个非等待行动都必须服务一个 intent layer；需要验证时先留下验证证据，再确认交付。",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _opt_int(value: Any) -> int | None:
@@ -418,6 +448,7 @@ class CognitiveLoop:
         self._institutional_identity_enabled = _env_flag(
             "CIVITASOS_INSTITUTIONAL_IDENTITY_ENABLED", default=False,
         )
+        self._h1_telos_enabled = _env_flag("CIVITASOS_H1_TELOS_ENABLED", default=False)
         self._last_identity_summary: dict[str, Any] | None = None
         self._identity_profile = _build_identity_profile(self._name, self._capabilities)
         self._mode = LoopMode.IDLE
@@ -427,6 +458,7 @@ class CognitiveLoop:
         # Callbacks
         self._on_perceive_fns: list[Any] = []
         self._on_reflect_fns: list[Any] = []
+        self._on_remember_fns: list[Any] = []
 
     # -- Properties ----------------------------------------------------------
 
@@ -464,6 +496,7 @@ class CognitiveLoop:
                 ctx.decision = Decision(action="wait", reasoning="bankrupt — shutting down")
                 ctx.phase = TickPhase.REMEMBER
                 await self._remember_tick(ctx)
+                self._emit_remember_callbacks(ctx)
                 return ctx
 
             # 1. Perceive
@@ -478,6 +511,10 @@ class CognitiveLoop:
             ctx.phase = TickPhase.EXPECT
             self._apply_expectation_layer(ctx)
 
+            if self._h1_telos_enabled:
+                ctx.phase = TickPhase.ALIGN
+                self._apply_telos_alignment(ctx)
+
             # 3. Decide (Rules → LLM)
             ctx.phase = TickPhase.DECIDE
             ctx.decision = await self._decide(ctx.briefing, ctx.memories)
@@ -486,14 +523,18 @@ class CognitiveLoop:
                 ctx.decision = ctx.decision or Decision(
                     action="wait", reasoning="No action needed"
                 )
+                self._annotate_decision_intent(ctx)
                 self._apply_llm_mode_request(ctx)
                 ctx.phase = TickPhase.REFLECT
                 ctx.reflection = ctx.decision.reasoning or "Waiting by decision."
                 self._emit_reflect_callbacks(ctx)
                 ctx.phase = TickPhase.REMEMBER
                 await self._remember_tick(ctx)
+                self._emit_remember_callbacks(ctx)
                 self._update_mode(ctx.briefing)
                 return ctx
+
+            self._annotate_decision_intent(ctx)
 
             # 4. Conscience check
             ctx.phase = TickPhase.CONSCIENCE
@@ -536,6 +577,7 @@ class CognitiveLoop:
                     self._apply_llm_mode_request(ctx)
                     self._emit_reflect_callbacks(ctx)
                     await self._remember_tick(ctx)
+                    self._emit_remember_callbacks(ctx)
                     return ctx
 
             # 5. Act
@@ -592,6 +634,7 @@ class CognitiveLoop:
             ctx.phase = TickPhase.REMEMBER
             self._apply_llm_mode_request(ctx)
             await self._remember_tick(ctx)
+            self._emit_remember_callbacks(ctx)
 
             self._update_mode(ctx.briefing)
 
@@ -835,6 +878,9 @@ class CognitiveLoop:
         subjective = briefing.get("subjective_time")
         if isinstance(subjective, dict) and subjective:
             system += _subjective_time_prompt_block(subjective)
+        telos_alignment = briefing.get("h1_telos_alignment")
+        if isinstance(telos_alignment, dict) and telos_alignment:
+            system += _telos_prompt_block(telos_alignment)
 
         # Fix 3: 任务交付强制 — 已认领任务必须立即调用 task_execute，禁止 wait。
         # 否则 LLM 倾向反复观望，导致 Claimed 任务永不交付。
@@ -1049,6 +1095,25 @@ class CognitiveLoop:
         except Exception:
             logger.debug("H.0 relation expectation trace failed", exc_info=True)
 
+    def _apply_telos_alignment(self, ctx: TickContext) -> None:
+        """Best-effort H.1 ALIGN trace generation; never blocks a tick."""
+        try:
+            alignment = build_telos_alignment(ctx.briefing, ctx.memories, ctx.action_bias)
+            ctx.telos_alignment = alignment
+            ctx.briefing["h1_telos_alignment"] = alignment
+        except Exception:
+            logger.debug("H.1 telos alignment failed", exc_info=True)
+
+    def _annotate_decision_intent(self, ctx: TickContext) -> None:
+        if not self._h1_telos_enabled or ctx.decision is None:
+            return
+        layer = served_intent_layer_for_action(
+            ctx.decision.action,
+            ctx.decision.params,
+            ctx.telos_alignment or ctx.briefing.get("h1_telos_alignment"),
+        )
+        ctx.decision.served_intent_layer = layer
+
     def _emit_reflect_callbacks(self, ctx: TickContext) -> None:
         """Notify observers once a tick has a reflect-phase snapshot."""
         for fn in self._on_reflect_fns:
@@ -1056,6 +1121,14 @@ class CognitiveLoop:
                 fn(ctx)
             except Exception:
                 logger.exception("Custom reflect callback failed")
+
+    def _emit_remember_callbacks(self, ctx: TickContext) -> None:
+        """Notify observers after per-tick memory and IEM anchors are saved."""
+        for fn in self._on_remember_fns:
+            try:
+                fn(ctx)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_remember callback failed")
 
     def _update_local_aspect_gap_from_tick(self, ctx: TickContext) -> None:
         """Update aspect_gap from local evidence when remote R2R data is missing.
@@ -1417,6 +1490,11 @@ class CognitiveLoop:
     def on_reflect(self, fn: Any) -> Any:
         """Register a callback invoked after each Reflect phase."""
         self._on_reflect_fns.append(fn)
+        return fn
+
+    def on_remember(self, fn: Any) -> Any:
+        """Register a callback invoked after each Remember phase."""
+        self._on_remember_fns.append(fn)
         return fn
 
     def wake(self, reason: str = "external") -> None:

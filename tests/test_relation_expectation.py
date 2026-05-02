@@ -66,6 +66,16 @@ def test_failure_refs_generate_directed_relation_expectation() -> None:
     assert bias["trust_hint"] == vector["expected_trust"]
     assert len(bias["reason_event_ids"]) == 2
 
+    training = ctx.briefing["h0_relation_training_invariants"]
+    assert training["schema_version"] == "h0g_relation_training.v1"
+    assert training["training_sample_present"] is True
+    assert training["negative_sample_present"] is True
+    assert training["negative_fast_learning_present"] is True
+    assert training["repair_sample_present"] is False
+    assert training["history_preserved_present"] is True
+    assert training["deltas"]["expected_trust"] < 0
+    assert training["deltas"]["expected_betrayal_risk"] > 0
+
     changed = {
         update.parameter_name: update
         for update in ctx.expectation_updates
@@ -103,6 +113,69 @@ def test_repair_refs_recover_slowly_without_erasing_history() -> None:
     assert vector["expected_repair_probability"] > 0.25
     assert ctx.surprise["relation"][key]["lifecycle_state"] == "confirmed"
     assert ctx.action_bias["relation"][key]["verification_level"] in {"elevated", "strict"}
+    training = ctx.briefing["h0_relation_training_invariants"]
+    assert training["repair_sample_present"] is True
+    assert training["repair_slow_recovery_present"] is True
+    assert training["history_preserved_present"] is True
+    assert training["learning_rates"]["expected_trust"]["repair"] < (
+        training["learning_rates"]["expected_trust"]["negative"]
+    )
+
+
+def test_failure_and_repair_refs_preserve_both_training_paths() -> None:
+    relation = _relation_context(
+        memory_refs=[
+            f"failure:{RELATION_ID}:failed-1:2026-05-01T00_00_00Z",
+            f"repair:{RELATION_ID}:repair-1:2026-05-01T00_03_00Z",
+        ],
+        recent_failures=[],
+        recent_repairs=[],
+    )
+    ctx = TickContext(briefing={"relation_context": relation})
+
+    assert apply_relation_matrix_expectation(ctx, local_identity=WORKER) is True
+
+    training = ctx.briefing["h0_relation_training_invariants"]
+    assert training["negative_sample_present"] is True
+    assert training["negative_fast_learning_present"] is True
+    assert training["repair_sample_present"] is True
+    assert training["repair_slow_recovery_present"] is True
+    assert training["history_preserved_present"] is True
+    assert training["failure_refs"] == [
+        f"failure:{RELATION_ID}:failed-1:2026-05-01T00_00_00Z"
+    ]
+    assert training["repair_refs"] == [
+        f"repair:{RELATION_ID}:repair-1:2026-05-01T00_03_00Z"
+    ]
+
+
+def test_saturated_relation_history_still_reports_learning_components() -> None:
+    relation = _relation_context(
+        memory_refs=[
+            f"failure:{RELATION_ID}:failed-1:2026-05-01T00_00_00Z",
+            f"repair:{RELATION_ID}:repair-1:2026-05-01T00_03_00Z",
+        ],
+        recent_failures=[],
+        recent_repairs=[],
+        relation_expectation={
+            "expected_trust": 0.0,
+            "expected_delivery_quality": 0.0,
+            "expected_cooperation": 0.0,
+            "expected_betrayal_risk": 1.0,
+            "expected_repair_probability": 1.0,
+            "precision": 0.95,
+        },
+    )
+    ctx = TickContext(briefing={"relation_context": relation})
+
+    assert apply_relation_matrix_expectation(ctx, local_identity=WORKER) is True
+
+    training = ctx.briefing["h0_relation_training_invariants"]
+    assert training["negative_fast_learning_present"] is True
+    assert training["repair_slow_recovery_present"] is True
+    assert training["deltas"]["expected_repair_probability"] == 0.0
+    assert training["learning_component_deltas"]["repair"]["expected_repair_probability"] > 0.0
+    assert training["learning_component_deltas"]["failure"]["expected_betrayal_risk"] > 0.0
 
 
 def test_relation_context_without_failure_or_repair_is_not_traced() -> None:
@@ -183,6 +256,27 @@ def test_loop_runs_relation_expectation_before_decide_and_persists_matrix() -> N
     assert ctx.briefing["iem_anchor"] == anchor
     state = agent.saved["identity_iem_state"]
     assert key in state["relation_expectation_matrix"]
+
+
+def test_on_remember_observes_persisted_iem_anchor() -> None:
+    agent = _RelationAgent()
+    loop = CognitiveLoop(agent, llm=_WaitLLM())
+    seen: list[dict] = []
+
+    @loop.on_remember
+    def capture(ctx):
+        seen.append({
+            "briefing_anchor": ctx.briefing.get("iem_anchor"),
+            "saved_anchor": agent.saved.get("identity_iem_anchor"),
+        })
+
+    asyncio.run(loop.tick())
+
+    assert seen
+    assert seen[0]["briefing_anchor"] == seen[0]["saved_anchor"]
+    assert seen[0]["saved_anchor"]["storage_hint"] == (
+        "civitasos://identity/did:civ:test:worker/iem/latest"
+    )
 
 
 def test_on_perceive_hook_can_feed_relation_context_to_expect_phase() -> None:

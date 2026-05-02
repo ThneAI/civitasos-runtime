@@ -75,6 +75,16 @@ def apply_relation_matrix_expectation(
     actual_delivery = 0.0 if failure_refs else 0.85
     surprise_score = round(abs(actual_delivery - prior.expected_delivery_quality) * after.precision, 4)
     valence = "negative" if failure_refs else "positive"
+    training_invariants = _training_invariants(
+        relation_id=relation_id,
+        from_identity=from_identity,
+        to_identity=to_identity,
+        before=prior,
+        after=after,
+        failure_refs=failure_refs,
+        repair_refs=repair_refs,
+        source_event_ids=source_event_ids,
+    )
     surprise = ExpectationTrace(
         domain=ExpectationDomain.RELATION,
         state_kind=ExpectationStateKind.PREDICTED,
@@ -112,6 +122,7 @@ def apply_relation_matrix_expectation(
             "drive_score": round(surprise_score * action_bias["required_stake_multiplier"], 4),
             "actionability": 1.0,
             "action_bias": action_bias,
+            "training_invariants": training_invariants,
             "constitution_verdict": "allowed: predicted relation update only",
         }
 
@@ -132,6 +143,7 @@ def apply_relation_matrix_expectation(
 
     ctx.briefing["h0_relation_expectation"] = expectation_payload
     ctx.briefing["h0_relation_action_bias"] = action_bias
+    ctx.briefing["h0_relation_training_invariants"] = training_invariants
     return True
 
 
@@ -255,6 +267,117 @@ def _action_bias(
         "direct_match_allowed": vector.expected_betrayal_risk < 0.75,
         "reason_event_ids": source_event_ids,
     }
+
+
+def _training_invariants(
+    *,
+    relation_id: str,
+    from_identity: str,
+    to_identity: str,
+    before: RelationExpectationVector,
+    after: RelationExpectationVector,
+    failure_refs: list[str],
+    repair_refs: list[str],
+    source_event_ids: list[str],
+) -> dict[str, Any]:
+    before_payload = asdict(before)
+    after_payload = asdict(after)
+    deltas = {
+        key: round(float(after_payload[key]) - float(before_payload[key]), 4)
+        for key in before_payload
+        if key in after_payload
+    }
+    component_deltas = _learning_component_deltas(
+        failures=len(failure_refs),
+        repairs=len(repair_refs),
+    )
+    learning_rates = {
+        "expected_trust": {"negative": 0.12, "repair": 0.04},
+        "expected_delivery_quality": {"negative": 0.18, "repair": 0.05},
+        "expected_cooperation": {"negative": 0.10, "repair": 0.04},
+        "expected_betrayal_risk": {"negative": 0.20, "repair": 0.05},
+        "expected_repair_probability": {"negative": 0.04, "repair": 0.14},
+    }
+    negative_sample = bool(failure_refs)
+    repair_sample = bool(repair_refs)
+    history_preserved = bool(source_event_ids) and set(source_event_ids) == set(
+        _dedupe([*failure_refs, *repair_refs])
+    )
+    return {
+        "schema_version": "h0g_relation_training.v1",
+        "relation_id": relation_id,
+        "from": from_identity,
+        "to": to_identity,
+        "state_kind": ExpectationStateKind.PREDICTED.value,
+        "training_sample_present": bool(source_event_ids),
+        "negative_sample_present": negative_sample,
+        "negative_fast_learning_present": negative_sample
+        and _negative_fast_learning(component_deltas["failure"]),
+        "repair_sample_present": repair_sample,
+        "repair_slow_recovery_present": repair_sample
+        and _repair_slow_recovery(component_deltas["repair"], learning_rates),
+        "history_preserved_present": history_preserved,
+        "normative_relation_guard_present": True,
+        "failure_refs": failure_refs,
+        "repair_refs": repair_refs,
+        "source_event_ids": source_event_ids,
+        "deltas": deltas,
+        "learning_component_deltas": component_deltas,
+        "learning_rates": learning_rates,
+    }
+
+
+def _learning_component_deltas(*, failures: int, repairs: int) -> dict[str, dict[str, float]]:
+    failure_weight = min(float(failures), 5.0)
+    repair_weight = min(float(repairs), 5.0)
+    failure = {
+        "expected_trust": -0.12 * failure_weight,
+        "expected_delivery_quality": -0.18 * failure_weight,
+        "expected_cooperation": -0.10 * failure_weight,
+        "expected_betrayal_risk": 0.20 * failure_weight,
+        "expected_repair_probability": -0.04 * failure_weight,
+        "precision": 0.08 * failure_weight,
+    }
+    repair = {
+        "expected_trust": 0.04 * repair_weight,
+        "expected_delivery_quality": 0.05 * repair_weight,
+        "expected_cooperation": 0.04 * repair_weight,
+        "expected_betrayal_risk": -0.05 * repair_weight,
+        "expected_repair_probability": 0.14 * repair_weight,
+        "precision": 0.08 * repair_weight,
+    }
+    net = {
+        key: failure.get(key, 0.0) + repair.get(key, 0.0)
+        for key in failure
+    }
+    return {
+        "failure": {key: round(value, 4) for key, value in failure.items()},
+        "repair": {key: round(value, 4) for key, value in repair.items()},
+        "net_unclamped": {key: round(value, 4) for key, value in net.items()},
+    }
+
+
+def _negative_fast_learning(deltas: dict[str, float]) -> bool:
+    return (
+        deltas.get("expected_trust", 0.0) < 0.0
+        and deltas.get("expected_delivery_quality", 0.0) < 0.0
+        and deltas.get("expected_betrayal_risk", 0.0) > 0.0
+        and deltas.get("precision", 0.0) > 0.0
+    )
+
+
+def _repair_slow_recovery(
+    deltas: dict[str, float],
+    learning_rates: dict[str, dict[str, float]],
+) -> bool:
+    trust_rates = learning_rates["expected_trust"]
+    betrayal_rates = learning_rates["expected_betrayal_risk"]
+    return (
+        trust_rates["repair"] < trust_rates["negative"]
+        and betrayal_rates["repair"] < betrayal_rates["negative"]
+        and deltas.get("expected_repair_probability", 0.0) > 0.0
+        and deltas.get("precision", 0.0) > 0.0
+    )
 
 
 def _update_log(

@@ -23,6 +23,7 @@ class TickPhase(str, Enum):
     PERCEIVE = "perceive"
     RECALL = "recall"
     EXPECT = "expect"
+    ALIGN = "align"
     DECIDE = "decide"
     CONSCIENCE = "conscience"
     ACT = "act"
@@ -84,6 +85,14 @@ class ExpectationLifecycleState(str, Enum):
     DEPRECATED = "deprecated"
 
 
+class IntentLayer(str, Enum):
+    IMMEDIATE = "immediate"
+    SHORT = "short"
+    MID = "mid"
+    LONG = "long"
+    TELOS = "telos"
+
+
 # ---------------------------------------------------------------------------
 # Core data classes
 # ---------------------------------------------------------------------------
@@ -96,6 +105,7 @@ class Decision:
     reasoning: str = ""
     confidence: float = 1.0
     source: DecisionSource = DecisionSource.RULES
+    served_intent_layer: str = ""
 
 
 @dataclass
@@ -202,6 +212,35 @@ class ExpectationUpdate:
     local_update_blocked: bool = False
 
 
+@dataclass(frozen=True)
+class IntentFrame:
+    """One layer in the H.1 intent stack."""
+    layer: IntentLayer
+    intent: str
+    source: str = ""
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True)
+class VerificationPlan:
+    """Verifier expectation derived before DECIDE."""
+    required: bool
+    level: str = "baseline"
+    tools: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TelosAlignmentTrace:
+    """H.1 ALIGN trace: intent stack + verifier plan."""
+    schema_version: str
+    active_layer: IntentLayer
+    intent_stack: list[IntentFrame]
+    verification_plan: VerificationPlan
+    source_task_id: str = ""
+    telos_source: str = ""
+
+
 @dataclass
 class RelationExpectationVector:
     """Minimal directed relation expectation vector for H.0-B."""
@@ -240,6 +279,7 @@ class TickContext:
     surprise: dict[str, Any] = field(default_factory=dict)
     drive: dict[str, Any] = field(default_factory=dict)
     action_bias: dict[str, Any] = field(default_factory=dict)
+    telos_alignment: dict[str, Any] = field(default_factory=dict)
     expectation_updates: list[ExpectationUpdate] = field(default_factory=list)
     decision: Decision | None = None
     conscience_verdict: ConscienceVerdict | None = None

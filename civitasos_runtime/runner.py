@@ -137,6 +137,13 @@ class AgentRunner:
         self._on_perceive_fns = callbacks
         return fn
 
+    def on_remember(self, fn: Callable) -> Callable:
+        """Decorator to register a post-remember callback."""
+        callbacks = getattr(self, "_on_remember_fns", [])
+        callbacks.append(fn)
+        self._on_remember_fns = callbacks
+        return fn
+
     # -- Lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
@@ -183,6 +190,8 @@ class AgentRunner:
             self._loop.on_reflect(self._on_reflect_fn)
         for fn in getattr(self, "_on_perceive_fns", []):
             self._loop.on_perceive(fn)
+        for fn in getattr(self, "_on_remember_fns", []):
+            self._loop.on_remember(fn)
 
         # 6. Install signal handlers for graceful shutdown
         for sig in (signal.SIGINT, signal.SIGTERM):
