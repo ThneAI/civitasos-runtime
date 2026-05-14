@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import quote
 
 from .conscience import Conscience
+from .delivery_contracts import verify_task_delivery
 from .energy import Energy
 from .iem_anchor import build_iem_anchor, genesis_iem_state
 from .identity_expectation import apply_identity_expectation_traces, apply_iem_updates_to_state
@@ -641,6 +642,7 @@ class CognitiveLoop:
                 return ctx
 
             self._annotate_decision_intent(ctx)
+            self._enforce_delivery_contract(ctx)
 
             # 4. Conscience check
             ctx.phase = TickPhase.CONSCIENCE
@@ -750,6 +752,52 @@ class CognitiveLoop:
         return ctx
 
     # -- Phase implementations -----------------------------------------------
+
+    def _enforce_delivery_contract(self, ctx: TickContext) -> None:
+        """Fail closed before task delivery when a task-local contract fails."""
+        decision = ctx.decision
+        if decision is None or decision.action != "task_execute":
+            return
+        task_id = str(decision.params.get("task_id") or "").strip()
+        if not task_id:
+            return
+        active_task = self._active_task_by_id(ctx.briefing, task_id)
+        verification = verify_task_delivery(active_task, decision.params.get("output"))
+        if verification.passed:
+            decision.params.setdefault("_delivery_contract_passed", True)
+            return
+
+        report = verification.as_dict()
+        report["task_id"] = task_id
+        ctx.briefing.setdefault("delivery_contract_violations", []).append(report)
+        logger.warning(
+            "Delivery contract blocked task_execute for %s: %s",
+            task_id,
+            "; ".join(verification.failure_reasons),
+        )
+        ctx.decision = Decision(
+            action="pool_fail",
+            params={"task_id": task_id},
+            reasoning=(
+                "delivery contract blocked task_execute: "
+                + "; ".join(verification.failure_reasons)
+            ),
+            confidence=1.0,
+            source=DecisionSource.HYBRID,
+        )
+
+    @staticmethod
+    def _active_task_by_id(briefing: dict[str, Any], task_id: str) -> dict[str, Any] | None:
+        active_tasks = briefing.get("active_tasks")
+        if not isinstance(active_tasks, list):
+            return None
+        for task in active_tasks:
+            if not isinstance(task, dict):
+                continue
+            candidate = str(task.get("task_id") or task.get("id") or "").strip()
+            if candidate == task_id:
+                return task
+        return None
 
     async def _perceive(self) -> dict[str, Any]:
         """Fetch briefing from CivitasOS."""

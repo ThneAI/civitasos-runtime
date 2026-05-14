@@ -1,0 +1,257 @@
+"""Delivery contracts for task outputs.
+
+This module turns task-local requirements into runtime-enforced checks. The
+goal is to make prompt text advisory while delivery eligibility is decided by
+typed rules before ``task_execute`` reaches the backend.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+
+_UPSTREAM_KEYS = ("upstream_output", "alpha_output", "beta_output")
+_CONTRACT_KEYS = (
+    "delivery_contract",
+    "expected_artifact_name",
+    "boundary",
+    *_UPSTREAM_KEYS,
+)
+
+_H3_CONTEXT_RE = re.compile(
+    r"(h\.?3|production|receipt|runtime execution|生产|生产就绪|生产授权|生产执行|生产回执)",
+    re.IGNORECASE,
+)
+_POSITIVE_BOUNDARY_RE = re.compile(
+    r"(通过|就绪|授权|批准|允许|解锁|可进入|ready|passed|approved|authorized|allowed|unblocked)",
+    re.IGNORECASE,
+)
+_NEGATIVE_BOUNDARY_RE = re.compile(
+    r"(不通过|未通过|不就绪|未就绪|不授权|未授权|禁止|不能|不可|无|保持\s*blocked|blocked|not\s+ready|not\s+passed|no\s+production|does\s+not|fail|failed|fails)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class TaskContract:
+    """Runtime contract derived from a claimed backend task."""
+
+    active: bool
+    required_sections: tuple[str, ...] = ()
+    forbidden_claims: tuple[str, ...] = ()
+    forbid_upstream_replay: bool = False
+    h3_must_remain_blocked: bool = False
+    review_must_have_issue_list: bool = False
+
+
+@dataclass(frozen=True)
+class DeliveryVerification:
+    """Result of checking one task output against its contract."""
+
+    passed: bool
+    failure_reasons: tuple[str, ...] = ()
+    contract: TaskContract = field(default_factory=lambda: TaskContract(active=False))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "passed": self.passed,
+            "failure_reasons": list(self.failure_reasons),
+            "contract": {
+                "active": self.contract.active,
+                "required_sections": list(self.contract.required_sections),
+                "forbidden_claims": list(self.contract.forbidden_claims),
+                "forbid_upstream_replay": self.contract.forbid_upstream_replay,
+                "h3_must_remain_blocked": self.contract.h3_must_remain_blocked,
+                "review_must_have_issue_list": self.contract.review_must_have_issue_list,
+            },
+        }
+
+
+def build_task_contract(task: dict[str, Any] | None) -> TaskContract:
+    """Build a strict contract only when the task asks for one or implies one."""
+    if not isinstance(task, dict):
+        return TaskContract(active=False)
+
+    task_input = task.get("input")
+    if not isinstance(task_input, dict):
+        task_input = {}
+
+    explicit = task_input.get("delivery_contract")
+    explicit_contract = explicit if isinstance(explicit, dict) else {}
+    has_contract_signal = bool(explicit_contract) or any(task_input.get(k) for k in _CONTRACT_KEYS)
+    capability = str(task.get("required_capability") or "").strip().lower()
+    instruction = str(task_input.get("instruction") or task.get("description") or "")
+    boundary = str(task_input.get("boundary") or "")
+    context = " ".join([instruction, boundary, capability]).lower()
+    has_h3_context = bool(_H3_CONTEXT_RE.search(context))
+    is_review = capability in {"review", "audit", "boundary_check"}
+
+    if not (has_contract_signal or has_h3_context or is_review):
+        return TaskContract(active=False)
+
+    required_sections = _text_tuple(explicit_contract.get("required_sections"))
+    if not required_sections:
+        required_sections = _default_required_sections(capability, task_input, has_h3_context)
+
+    forbidden_claims = _text_tuple(explicit_contract.get("forbidden_claims"))
+    if has_h3_context and not forbidden_claims:
+        forbidden_claims = (
+            "production readiness passed",
+            "production runtime execution authorized",
+            "production receipt write allowed",
+            "H3 unblocked",
+        )
+
+    return TaskContract(
+        active=True,
+        required_sections=required_sections,
+        forbidden_claims=forbidden_claims,
+        forbid_upstream_replay=bool(explicit_contract.get("forbid_upstream_replay", True)),
+        h3_must_remain_blocked=bool(explicit_contract.get("h3_must_remain_blocked", has_h3_context)),
+        review_must_have_issue_list=bool(explicit_contract.get("review_must_have_issue_list", is_review)),
+    )
+
+
+def verify_task_delivery(task: dict[str, Any] | None, output: Any) -> DeliveryVerification:
+    """Return whether ``output`` is eligible for backend delivery."""
+    contract = build_task_contract(task)
+    if not contract.active:
+        return DeliveryVerification(passed=True, contract=contract)
+
+    text = _output_text(output)
+    reasons: list[str] = []
+    if not text:
+        reasons.append("output is empty")
+    for section in contract.required_sections:
+        if section and not _has_required_section(text, section):
+            reasons.append(f"missing required section: {section}")
+    if contract.forbid_upstream_replay and _looks_like_upstream_replay(text, task):
+        reasons.append("output replays upstream content")
+    if contract.h3_must_remain_blocked and _contains_positive_h3_claim(text):
+        reasons.append("output makes a positive H3/production authorization claim")
+    if contract.review_must_have_issue_list and not _has_issue_list(text):
+        reasons.append("review output lacks an issue list")
+
+    return DeliveryVerification(
+        passed=not reasons,
+        failure_reasons=tuple(reasons),
+        contract=contract,
+    )
+
+
+def _default_required_sections(
+    capability: str,
+    task_input: dict[str, Any],
+    has_h3_context: bool,
+) -> tuple[str, ...]:
+    if capability in {"implementation", "repair"} and _has_upstream(task_input):
+        sections = ["变更摘要", "与上游不同之处"]
+        if has_h3_context:
+            sections.append("H3")
+        return tuple(sections)
+    if capability in {"review", "audit", "boundary_check"}:
+        return ("通过/不通过", "问题清单")
+    return ()
+
+
+def _text_tuple(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value.strip(),) if value.strip() else ()
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(item).strip() for item in value if str(item).strip())
+    return ()
+
+
+def _has_upstream(task_input: dict[str, Any]) -> bool:
+    return any(bool(task_input.get(key)) for key in _UPSTREAM_KEYS)
+
+
+def _output_text(output: Any) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output.strip()
+    try:
+        return json.dumps(output, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return str(output).strip()
+
+
+def _normalise_replay_text(value: Any) -> str:
+    text = _output_text(value)
+    if text.startswith("```"):
+        text = text.strip("` \n")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _extract_upstream_outputs(task: dict[str, Any] | None) -> list[str]:
+    if not isinstance(task, dict):
+        return []
+    task_input = task.get("input")
+    if not isinstance(task_input, dict):
+        return []
+    return [
+        str(task_input[key]).strip()
+        for key in _UPSTREAM_KEYS
+        if task_input.get(key) not in (None, "")
+    ]
+
+
+def _looks_like_upstream_replay(output: Any, task: dict[str, Any] | None) -> bool:
+    out = _normalise_replay_text(output)
+    if not out:
+        return False
+    for upstream in _extract_upstream_outputs(task):
+        up = _normalise_replay_text(upstream)
+        if up and (out == up or out in up or up in out):
+            return True
+        nested = _extract_nested_result(upstream)
+        if nested and (out == nested or nested in out or out in nested):
+            return True
+    return False
+
+
+def _extract_nested_result(value: str) -> str:
+    text = value.strip().strip("` \n")
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return _normalise_replay_text(parsed.get("result"))
+
+
+def _contains_positive_h3_claim(text: str) -> bool:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or not _H3_CONTEXT_RE.search(line):
+            continue
+        if not _POSITIVE_BOUNDARY_RE.search(line):
+            continue
+        if _NEGATIVE_BOUNDARY_RE.search(line):
+            continue
+        return True
+    return False
+
+
+def _has_issue_list(text: str) -> bool:
+    return "问题清单" in text or re.search(r"\b(issue|issues|findings?)\b", text, re.IGNORECASE) is not None
+
+
+def _has_required_section(text: str, section: str) -> bool:
+    if section == "通过/不通过":
+        chinese_verdict = "通过" in text and "不通过" in text
+        english_verdict = (
+            re.search(r"\bverdict\b", text, re.IGNORECASE) is not None
+            and re.search(r"\b(pass|passed|fail|failed|blocked)\b", text, re.IGNORECASE) is not None
+        )
+        return chinese_verdict or english_verdict
+    if section == "问题清单":
+        return _has_issue_list(text)
+    if section.upper() == "H3":
+        return re.search(r"\bH\.?3\b", text, re.IGNORECASE) is not None
+    return section in text
