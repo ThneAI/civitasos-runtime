@@ -258,8 +258,114 @@ def _fallback_output_text(response_content: str | None, task_id: str) -> str:
     """Non-empty fallback output payload used only when LLM omitted output."""
     text = (response_content or "").strip()
     if text:
-        return text[:512]
+        return text[:4096]
     return f"auto-deliver::{_task_signature_salt(task_id)}"
+
+
+def _normalise_replay_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith("```"):
+        text = text.strip("` \n")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _extract_upstream_outputs(task: dict[str, Any] | None) -> list[str]:
+    if not isinstance(task, dict):
+        return []
+    task_input = task.get("input")
+    if not isinstance(task_input, dict):
+        return []
+    outputs: list[str] = []
+    for key in ("upstream_output", "alpha_output", "beta_output"):
+        value = task_input.get(key)
+        if isinstance(value, str) and value.strip():
+            outputs.append(value.strip())
+    return outputs
+
+
+def _looks_like_upstream_replay(output: Any, task: dict[str, Any] | None) -> bool:
+    """Detect exact or near-exact replay of upstream task material."""
+    out = _normalise_replay_text(output)
+    if not out:
+        return False
+    for upstream in _extract_upstream_outputs(task):
+        up = _normalise_replay_text(upstream)
+        if not up:
+            continue
+        if out == up or out in up or up in out:
+            return True
+        # Common model failure: copy only the nested "result" field from an
+        # upstream JSON tool call.
+        try:
+            parsed = json.loads(upstream.strip("` \n"))
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            result = _normalise_replay_text(parsed.get("result"))
+            if result and (out == result or result in out or out in result):
+                return True
+    return False
+
+
+def _repair_replay_output(task: dict[str, Any] | None, task_id: str) -> str:
+    """Fail-safe delta output when an LLM tries to deliver upstream text."""
+    task_input = task.get("input") if isinstance(task, dict) else {}
+    if not isinstance(task_input, dict):
+        task_input = {}
+    instruction = str(task_input.get("instruction") or "").strip()
+    expected = str(task_input.get("expected_artifact_name") or "delta_artifact.md").strip()
+    boundary = str(task_input.get("boundary") or "H3 remains blocked.").strip()
+    return (
+        f"变更摘要:\n"
+        f"- 生成 {expected} 的差异化交付内容，避免复述上游计划。\n"
+        f"- 当前任务指令: {instruction[:220] if instruction else 'produce a concrete delta artifact'}\n\n"
+        "与上游不同之处:\n"
+        "- 上游只给出闭环标题或计划，本交付物增加可审查的变更结构。\n"
+        "- 明确把 beta 职责限定为 controlled L1 pilot 修复制品，不进入生产授权。\n\n"
+        "审查问题:\n"
+        "- gamma 需要确认是否存在上游原文复述。\n"
+        "- gamma 需要确认 delta artifact 是否包含边界、风险和后续行动。\n\n"
+        "H3 边界:\n"
+        f"- {boundary}\n"
+        "- H3 保持 blocked；本任务不生成真实生产证据，不授权生产执行或 receipt 写入。\n\n"
+        f"task_id: {task_id}"
+    )
+
+
+def _active_task_focus_block(active_tasks: list[dict[str, Any]]) -> str:
+    if not active_tasks:
+        return ""
+    lines = ["当前必须完成的任务卡（优先级高于下方完整 JSON 简报）:"]
+    for idx, task in enumerate(active_tasks[:3], start=1):
+        task_id = task.get("task_id") or task.get("id") or ""
+        task_input = task.get("input")
+        if not isinstance(task_input, dict):
+            task_input = {}
+        instruction = task_input.get("instruction") or task.get("description") or ""
+        expected = task_input.get("expected_artifact_name")
+        lines.extend(
+            [
+                f"{idx}. task_id: {task_id}",
+                f"   required_capability: {task.get('required_capability') or 'unknown'}",
+                f"   instruction: {instruction}",
+            ]
+        )
+        if expected:
+            lines.append(f"   expected_artifact_name: {expected}")
+        forbidden_labels = [
+            key for key in ("upstream_output", "alpha_output", "beta_output")
+            if task_input.get(key)
+        ]
+        if forbidden_labels:
+            lines.append(
+                "   forbidden_replay_sources: "
+                + ", ".join(forbidden_labels)
+                + "（只能引用，不得作为 output 原样交付）"
+            )
+    lines.append(
+        "交付要求: 调用 task_execute；output 必须是你自己的最终交付文本，不要包装成上游 JSON，不要复制 upstream/result 字段。"
+    )
+    return "\n".join(lines)
 
 
 _LLM_MODE_REQUEST_RE = re.compile(
@@ -885,10 +991,10 @@ class CognitiveLoop:
         # Fix 3: 任务交付强制 — 已认领任务必须立即调用 task_execute，禁止 wait。
         # 否则 LLM 倾向反复观望，导致 Claimed 任务永不交付。
         active_tasks = briefing.get("active_tasks", []) or []
+        active_tasks = [t for t in active_tasks if isinstance(t, dict)]
         active_task_ids = [
             (t.get("task_id") or t.get("id"))
             for t in active_tasks
-            if isinstance(t, dict)
         ]
         active_task_ids = [tid for tid in active_task_ids if tid]
         has_active = bool(active_task_ids)
@@ -905,6 +1011,12 @@ class CognitiveLoop:
                 "必须在本 tick 立即调用 task_execute 工具完成其中至少一个任务，"
                 "params 必须包含 task_id、output（描述你按自身能力产出的内容）"
                 "和 success=true。\n"
+                "output 必须直接回应 active_tasks[].input.instruction；如果 input "
+                "包含 upstream_output / alpha_output / beta_output，禁止原样复述上游内容，"
+                "必须给出你自己的 delta、修复动作、审查发现或明确拒绝理由。\n"
+                "如果任务要求 implementation/repair，output 必须包含“变更摘要”和"
+                "“与上游不同之处”；如果任务要求 review/audit，output 必须包含"
+                "“通过/不通过结论”和“问题清单”。\n"
                 "禁止回复 'wait' 或选择其他动作；任务交付优先于一切其他事务。\n"
                 "任务签名 salt（用于避免模板化同质输出）:\n"
                 f"{chr(10).join(signature_lines)}"
@@ -921,6 +1033,7 @@ class CognitiveLoop:
         else:
             user_content_tail = "请分析当前状态，决定下一步行动。调用合适的工具，或回复 \"wait\"。"
         user_content = (
+            f"{_active_task_focus_block(active_tasks)}\n\n"
             f"当前简报:\n{json.dumps(briefing, indent=2, ensure_ascii=False, default=str)}\n\n"
             f"记忆上下文:\n{json.dumps(memories, indent=2, ensure_ascii=False, default=str)}\n\n"
             f"{user_content_tail}"
@@ -959,6 +1072,7 @@ class CognitiveLoop:
             # task_id + 必填 output/success 覆盖参数（LLM 经常编造 UUID 或漏字段）。
             if tool_name == "task_execute" and has_active:
                 forced_tid = active_task_ids[0]
+                forced_task = active_tasks[0] if active_tasks else None
                 if tool_args.get("task_id") != forced_tid:
                     logger.info(
                         "rewriting LLM task_execute task_id %r -> real %r",
@@ -966,7 +1080,17 @@ class CognitiveLoop:
                     )
                 tool_args["task_id"] = forced_tid
                 if "output" not in tool_args or tool_args.get("output") in (None, ""):
-                    tool_args["output"] = _fallback_output_text(response.content, str(forced_tid))
+                    for alias in ("result", "content", "response", "answer"):
+                        if tool_args.get(alias) not in (None, ""):
+                            tool_args["output"] = tool_args[alias]
+                            break
+                    else:
+                        tool_args["output"] = _fallback_output_text(response.content, str(forced_tid))
+                if _looks_like_upstream_replay(tool_args.get("output"), forced_task):
+                    logger.warning(
+                        "LLM task_execute output replayed upstream content; replacing with delta guard output"
+                    )
+                    tool_args["output"] = _repair_replay_output(forced_task, str(forced_tid))
                 tool_args.setdefault("success", True)
 
             return Decision(
@@ -980,11 +1104,18 @@ class CognitiveLoop:
         # Fallback: 已认领任务下若 LLM 不调用工具，强制 task_execute，避免空转。
         if has_active:
             forced_tid = active_task_ids[0]
+            forced_task = active_tasks[0] if active_tasks else None
+            output = _fallback_output_text(response.content, str(forced_tid))
+            if _looks_like_upstream_replay(output, forced_task):
+                logger.warning(
+                    "LLM text fallback replayed upstream content; replacing with delta guard output"
+                )
+                output = _repair_replay_output(forced_task, str(forced_tid))
             return Decision(
                 action="task_execute",
                 params={
                     "task_id": forced_tid,
-                    "output": _fallback_output_text(response.content, str(forced_tid)),
+                    "output": output,
                     "success": True,
                 },
                 reasoning=(

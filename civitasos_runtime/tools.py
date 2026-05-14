@@ -36,6 +36,9 @@ _SKIP_METHODS = frozenset({
     "generate_keys", "load_keys", "sign", "authenticate",
     "save_identity", "load_identity", "set_api_version",
     "discover_nodes", "wait_ready", "ping",
+    # Event wakeup is managed by AgentRunner. Exposing these to the LLM causes
+    # malformed event subscriptions and does not help task execution.
+    "webhook_register", "webhook_unregister",
     "refresh_token", "list_system_agents",
     # Worker pattern (we ARE the loop)
     "start_worker", "stop_worker", "task_handler",
@@ -241,6 +244,13 @@ class ToolRegistry:
                     and n != "self"}
         cleaned: dict[str, Any] = {}
         dropped: list[str] = []
+        fn_name = getattr(fn, "__name__", "")
+        if fn_name == "task_execute" and "output" in accepted and "output" not in params:
+            for alias in ("result", "content", "response", "answer"):
+                if params.get(alias) not in (None, ""):
+                    params = dict(params)
+                    params["output"] = params[alias]
+                    break
         for k, v in params.items():
             if k in accepted:
                 cleaned[k] = v
@@ -253,7 +263,6 @@ class ToolRegistry:
 
         # Normalize known SDK schema hotspots so malformed LLM args do not
         # hard-fail the HTTP layer (e.g., metadata must be Dict[str, str]).
-        fn_name = getattr(fn, "__name__", "")
         if fn_name == "task_execute" and "metadata" in cleaned:
             metadata = cleaned.get("metadata")
             if isinstance(metadata, dict):
