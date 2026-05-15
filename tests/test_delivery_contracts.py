@@ -77,6 +77,32 @@ def test_h3_contract_blocks_positive_production_authorization_claims() -> None:
     assert "output makes a positive H3/production authorization claim" in report.failure_reasons
 
 
+def test_h3_contract_does_not_treat_through_as_pass_status() -> None:
+    report = verify_task_delivery(
+        _implementation_task(),
+        (
+            "## 变更摘要\n"
+            "通过增加边界说明，生产路径继续保持隔离。\n"
+            "## 与上游不同之处\n"
+            "不是复述。\n"
+            "## H3\n"
+            "H.3 remains blocked."
+        ),
+    )
+
+    assert report.passed is True
+
+
+def test_h3_contract_blocks_chinese_pass_status_claims() -> None:
+    report = verify_task_delivery(
+        _review_task(),
+        "## 通过/不通过\nH3 已通过生产准入。\n## 问题清单\n- none",
+    )
+
+    assert report.passed is False
+    assert "output makes a positive H3/production authorization claim" in report.failure_reasons
+
+
 def test_review_contract_requires_issue_list() -> None:
     report = verify_task_delivery(
         _review_task(),

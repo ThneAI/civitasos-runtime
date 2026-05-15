@@ -185,6 +185,7 @@ class CivitasGateway:
         app.router.add_get("/v1/tools", self._handle_list_tools)
         app.router.add_post("/v1/tools/{name}", self._handle_tool_call)
         app.router.add_post("/v1/delegate", self._handle_delegate)
+        app.router.add_post("/", self._handle_wake)
         app.router.add_post("/v1/wake", self._handle_wake)
         app.router.add_get("/v1/status", self._handle_status)
         app.router.add_get("/v1/ledger", self._handle_ledger)

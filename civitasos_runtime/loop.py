@@ -50,6 +50,17 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _preview_value(value: Any, limit: int = 500) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            text = str(value)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
 def _build_identity_profile(name: str, capabilities: list[str]) -> dict[str, Any]:
     """Derive a stable identity profile from static agent traits."""
     caps = sorted(c.strip().lower() for c in capabilities if c and c.strip())
@@ -769,11 +780,13 @@ class CognitiveLoop:
 
         report = verification.as_dict()
         report["task_id"] = task_id
+        report["output_preview"] = _preview_value(decision.params.get("output"))
         ctx.briefing.setdefault("delivery_contract_violations", []).append(report)
         logger.warning(
-            "Delivery contract blocked task_execute for %s: %s",
+            "Delivery contract blocked task_execute for %s: %s | output_preview=%r",
             task_id,
             "; ".join(verification.failure_reasons),
+            report["output_preview"],
         )
         ctx.decision = Decision(
             action="pool_fail",

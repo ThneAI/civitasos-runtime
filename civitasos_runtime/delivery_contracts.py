@@ -26,7 +26,17 @@ _H3_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _POSITIVE_BOUNDARY_RE = re.compile(
-    r"(通过|就绪|授权|批准|允许|解锁|可进入|ready|passed|approved|authorized|allowed|unblocked)",
+    r"(就绪|授权|批准|允许|解锁|可进入|ready|passed|approved|authorized|allowed|unblocked)",
+    re.IGNORECASE,
+)
+_POSITIVE_PASS_STATUS_RE = re.compile(
+    r"("
+    r"(?:h\.?3|production|生产|生产就绪|生产授权|生产执行|生产回执)"
+    r".{0,12}(?:已|已经|可|可以)?\s*通过"
+    r"|"
+    r"(?:审批|审核|审查|验证|测试|门禁|gate|readiness)"
+    r".{0,12}通过"
+    r")",
     re.IGNORECASE,
 )
 _NEGATIVE_BOUNDARY_RE = re.compile(
@@ -230,7 +240,9 @@ def _contains_positive_h3_claim(text: str) -> bool:
         line = raw_line.strip()
         if not line or not _H3_CONTEXT_RE.search(line):
             continue
-        if not _POSITIVE_BOUNDARY_RE.search(line):
+        has_positive_boundary = bool(_POSITIVE_BOUNDARY_RE.search(line))
+        has_positive_pass_status = bool(_POSITIVE_PASS_STATUS_RE.search(line))
+        if not has_positive_boundary and not has_positive_pass_status:
             continue
         if _NEGATIVE_BOUNDARY_RE.search(line):
             continue
