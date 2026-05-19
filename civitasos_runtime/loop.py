@@ -19,7 +19,7 @@ from typing import Any
 from urllib.parse import quote
 
 from .conscience import Conscience
-from .delivery_contracts import verify_task_delivery
+from .delivery_contracts import build_task_contract, verify_task_delivery
 from .energy import Energy
 from .iem_anchor import build_iem_anchor, genesis_iem_state
 from .identity_expectation import apply_identity_expectation_traces, apply_iem_updates_to_state
@@ -266,12 +266,155 @@ def _task_signature_salt(task_id: str) -> str:
     return f"{suffix}-{digest}"
 
 
-def _fallback_output_text(response_content: str | None, task_id: str) -> str:
+def _fallback_output_text(
+    response_content: str | None,
+    task_id: str,
+    task: dict[str, Any] | None = None,
+) -> str:
     """Non-empty fallback output payload used only when LLM omitted output."""
     text = (response_content or "").strip()
+    if isinstance(task, dict):
+        contract = build_task_contract(task)
+        if contract.active:
+            return _contract_fallback_output(text, task_id, task, contract.required_sections)
     if text:
         return text[:4096]
     return f"auto-deliver::{_task_signature_salt(task_id)}"
+
+
+def _contract_fallback_output(
+    response_content: str,
+    task_id: str,
+    task: dict[str, Any],
+    required_sections: tuple[str, ...],
+) -> str:
+    """Build a minimal contract-shaped delivery when the LLM omitted tool args.
+
+    This is intentionally conservative: it preserves H3 blocking boundaries and
+    labels the output as a runtime fallback instead of pretending it is rich work.
+    """
+    capability = str(task.get("required_capability") or "").strip().lower()
+    task_input = task.get("input") if isinstance(task.get("input"), dict) else {}
+    instruction = str(task_input.get("instruction") or task.get("description") or "").strip()
+    source_text = response_content[:1200] if response_content else "LLM did not provide a structured tool output."
+    blocks: list[str] = []
+    required = set(required_sections)
+
+    handled_sections: set[str] = set()
+    if "变更摘要" in required:
+        handled_sections.add("变更摘要")
+        blocks.append(
+            "## 变更摘要\n"
+            f"生成 contract-safe fallback 交付，任务 {task_id} 未执行任何生产动作。"
+        )
+    if "与上游不同之处" in required:
+        handled_sections.add("与上游不同之处")
+        blocks.append(
+            "## 与上游不同之处\n"
+            "未复述上游输出；仅给出当前 agent 的最小安全 delta，并保留受控试点边界。"
+        )
+    if any(section.upper() == "H3" for section in required) or "h3" in instruction.lower():
+        handled_sections.update(section for section in required if section.upper() == "H3")
+        blocks.append(
+            "## H3\n"
+            "H.3 remains blocked: no production readiness, no runtime execution authorization, "
+            "and no production receipt writes."
+        )
+    if "通过/不通过" in required:
+        handled_sections.add("通过/不通过")
+        blocks.append(
+            "## 通过/不通过\n"
+            "L1 controlled pilot can continue. Production readiness does not pass; H.3 remains blocked."
+        )
+    if "问题清单" in required:
+        handled_sections.add("问题清单")
+        blocks.append(
+            "## 问题清单\n"
+            "- LLM did not provide a structured tool output.\n"
+            "- Runtime returned a bounded fallback and kept execution scope closed."
+        )
+    for section in required_sections:
+        if not section or section in handled_sections:
+            continue
+        blocks.append(_generic_contract_section(section, task_id))
+    if not blocks:
+        label = capability or "task"
+        blocks.append(
+            f"## {label} fallback\n"
+            f"{source_text}\n\n"
+            "Boundary: controlled pilot only; no production runtime authorization."
+        )
+    if response_content and not required:
+        blocks.append(f"## LLM 原始文本摘要\n{source_text}")
+    elif response_content:
+        blocks.append(
+            "## LLM 原始文本摘要\n"
+            "LLM provided unstructured text; raw content is omitted from this "
+            "contract-safe fallback so unsafe or ambiguous wording is not promoted "
+            "to delivery."
+        )
+    return "\n".join(blocks)[:4096]
+
+
+def _generic_contract_section(section: str, task_id: str) -> str:
+    """Create a conservative fallback block for explicit task-local headings."""
+    if section == "任务边界":
+        return (
+            "## 任务边界\n"
+            f"任务 {task_id} 仅限 L1 controlled pilot；不声明生产就绪，不授权运行时生产执行，"
+            "不写入生产 receipt。"
+        )
+    if section == "执行计划":
+        return (
+            "## 执行计划\n"
+            "- 保持在受控试点环境内完成任务交付。\n"
+            "- 记录可审查输出与失败边界。\n"
+            "- 后续由下游 agent 审查差异、风险和 H.3 阻断状态。"
+        )
+    return (
+        f"## {section}\n"
+        f"任务 {task_id} 的 contract-safe fallback section；受控试点边界保持，外部执行路径保持关闭。"
+    )
+
+
+def _repair_contract_output_if_safe(
+    output: Any,
+    task: dict[str, Any] | None,
+    task_id: str,
+) -> Any:
+    """Repair shape-only contract failures while preserving semantic fail-closed rules."""
+    verification = verify_task_delivery(task, output)
+    if verification.passed or not verification.contract.active:
+        return output
+    if not _contract_failure_is_shape_only(verification.failure_reasons):
+        return output
+
+    repaired = _contract_fallback_output(
+        _preview_value(output, limit=1200),
+        task_id,
+        task if isinstance(task, dict) else {},
+        verification.contract.required_sections,
+    )
+    repaired_verification = verify_task_delivery(task, repaired)
+    if repaired_verification.passed:
+        logger.warning(
+            "LLM task_execute output failed contract shape only; replacing with contract-safe fallback "
+            "for %s: %s",
+            task_id,
+            "; ".join(verification.failure_reasons),
+        )
+        return repaired
+    return output
+
+
+def _contract_failure_is_shape_only(reasons: tuple[str, ...]) -> bool:
+    """Only missing/empty structure can be repaired; semantic failures still block."""
+    if not reasons:
+        return False
+    return all(
+        reason == "output is empty" or reason.startswith("missing required section: ")
+        for reason in reasons
+    )
 
 
 def _normalise_replay_text(value: Any) -> str:
@@ -333,7 +476,7 @@ def _repair_replay_output(task: dict[str, Any] | None, task_id: str) -> str:
         f"- 当前任务指令: {instruction[:220] if instruction else 'produce a concrete delta artifact'}\n\n"
         "与上游不同之处:\n"
         "- 上游只给出闭环标题或计划，本交付物增加可审查的变更结构。\n"
-        "- 明确把 beta 职责限定为 controlled L1 pilot 修复制品，不进入生产授权。\n\n"
+        "- 明确把 beta 职责限定为 controlled L1 pilot 修复制品，外部执行路径保持关闭。\n\n"
         "审查问题:\n"
         "- gamma 需要确认是否存在上游原文复述。\n"
         "- gamma 需要确认 delta artifact 是否包含边界、风险和后续行动。\n\n"
@@ -378,6 +521,127 @@ def _active_task_focus_block(active_tasks: list[dict[str, Any]]) -> str:
         "交付要求: 调用 task_execute；output 必须是你自己的最终交付文本，不要包装成上游 JSON，不要复制 upstream/result 字段。"
     )
     return "\n".join(lines)
+
+
+def _normalise_capability_set(values: list[Any]) -> set[str]:
+    normalised: set[str] = set()
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("id") or value.get("name") or value.get("capability") or ""
+        for part in str(value).split(","):
+            text = part.strip().lower()
+            if text:
+                normalised.add(text)
+    return normalised
+
+
+def _briefing_agent_id(briefing: dict[str, Any]) -> str:
+    agent = briefing.get("agent") if isinstance(briefing.get("agent"), dict) else {}
+    return str(
+        briefing.get("agent_id")
+        or briefing.get("did")
+        or agent.get("did")
+        or agent.get("agent_id")
+        or ""
+    ).strip()
+
+
+def _briefing_capabilities(briefing: dict[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    agent = briefing.get("agent") if isinstance(briefing.get("agent"), dict) else {}
+    for source in (briefing.get("capabilities"), agent.get("capabilities")):
+        if isinstance(source, list):
+            values.extend(source)
+        elif source:
+            values.append(source)
+    return values
+
+
+def _wake_event_data(event: dict[str, Any]) -> dict[str, Any]:
+    data = event.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _wake_event_task_id(event: dict[str, Any]) -> str:
+    data = _wake_event_data(event)
+    return str(event.get("task_id") or data.get("task_id") or data.get("id") or "").strip()
+
+
+def _capability_matches(required: Any, capabilities: set[str]) -> bool:
+    required_text = str(required or "").strip().lower()
+    if not required_text:
+        return False
+    return "*" in capabilities or required_text in capabilities
+
+
+def _build_wake_action_bias(
+    briefing: dict[str, Any],
+    capabilities: list[Any],
+) -> dict[str, Any] | None:
+    """Build a deterministic action hint from backend wake events.
+
+    The only automatic state-changing bias is a capability-matched
+    `task.posted -> pool_claim` when the agent has no active task. Other event
+    types remain observable context for the next LLM tick.
+    """
+    events = briefing.get("backend_wake_events")
+    if not isinstance(events, list) or not events:
+        return None
+    active_tasks = briefing.get("active_tasks")
+    if isinstance(active_tasks, list) and active_tasks:
+        return None
+
+    agent_id = _briefing_agent_id(briefing)
+    capability_set = _normalise_capability_set(
+        list(capabilities) + _briefing_capabilities(briefing)
+    )
+
+    for event in reversed(events):
+        if not isinstance(event, dict):
+            continue
+        event_name = str(event.get("event") or "").strip()
+        if event_name != "task.posted":
+            continue
+        data = _wake_event_data(event)
+        task_id = _wake_event_task_id(event)
+        required = data.get("required_capability")
+        requester = str(data.get("requester") or "").strip()
+        if not task_id:
+            continue
+        if requester and agent_id and requester == agent_id:
+            continue
+        if not _capability_matches(required, capability_set):
+            continue
+        return {
+            "schema_version": "civitasos-wake-action-bias:v1",
+            "source_event": event_name,
+            "action": "pool_claim",
+            "task_id": task_id,
+            "required_capability": required,
+            "requester": requester,
+            "confidence": 0.92,
+            "reason": "backend task.posted event matches local capability and no active task is held",
+            "non_claims": [
+                "wake_bias_does_not_skip_conscience",
+                "wake_bias_does_not_execute_task_output",
+            ],
+        }
+    return None
+
+
+def _wake_action_bias_block(bias: dict[str, Any] | None) -> str:
+    if not isinstance(bias, dict) or not bias:
+        return ""
+    return (
+        "Backend wake action bias（结构化事件优先级）:\n"
+        f"- source_event: {bias.get('source_event')}\n"
+        f"- suggested_action: {bias.get('action')}\n"
+        f"- task_id: {bias.get('task_id')}\n"
+        f"- required_capability: {bias.get('required_capability')}\n"
+        f"- reason: {bias.get('reason')}\n"
+        "要求: 该 bias 仍需经过 conscience / scope / backend 状态机校验；"
+        "不得把它当成生产授权或交付完成证明。"
+    )
 
 
 _LLM_MODE_REQUEST_RE = re.compile(
@@ -572,6 +836,7 @@ class CognitiveLoop:
         self._mode = LoopMode.IDLE
         self._tick_count = 0
         self._wake_event: asyncio.Event | None = None
+        self._pending_wake_events: list[dict[str, Any]] = []
 
         # Callbacks
         self._on_perceive_fns: list[Any] = []
@@ -823,6 +1088,13 @@ class CognitiveLoop:
         # Update energy from economics
         self._energy.refresh(briefing.get("economics", {}))
         briefing["_identity_prompt_injected"] = False
+        wake_events = self._drain_wake_events()
+        if wake_events:
+            briefing["backend_wake_events"] = wake_events
+            briefing["latest_backend_wake_event"] = wake_events[-1]
+            wake_bias = _build_wake_action_bias(briefing, self._capabilities)
+            if wake_bias:
+                briefing["backend_wake_action_bias"] = wake_bias
 
         # Fix 1: 观 → 决策管线 — fetch aspect gap
         try:
@@ -988,8 +1260,36 @@ class CognitiveLoop:
         if rule_decision is not None:
             return rule_decision
 
+        wake_decision = self._decision_from_wake_action_bias(briefing)
+        if wake_decision is not None:
+            return wake_decision
+
         # Fall back to LLM
         return await self._decide_llm(briefing, memories)
+
+    def _decision_from_wake_action_bias(self, briefing: dict[str, Any]) -> Decision | None:
+        bias = briefing.get("backend_wake_action_bias")
+        if not isinstance(bias, dict):
+            return None
+        if bias.get("action") != "pool_claim":
+            return None
+        if self._tools.get("pool_claim") is None:
+            return None
+        task_id = str(bias.get("task_id") or "").strip()
+        if not task_id:
+            return None
+        return Decision(
+            action="pool_claim",
+            params={
+                "task_id": task_id,
+                "poster_id": bias.get("requester") or "",
+                "_wake_event_driven": True,
+                "_wake_source_event": bias.get("source_event") or "",
+            },
+            reasoning=str(bias.get("reason") or "backend wake event suggested pool_claim"),
+            confidence=float(bias.get("confidence") or 0.8),
+            source=DecisionSource.RULES,
+        )
 
     async def _decide_llm(
         self,
@@ -1095,6 +1395,7 @@ class CognitiveLoop:
             user_content_tail = "请分析当前状态，决定下一步行动。调用合适的工具，或回复 \"wait\"。"
         user_content = (
             f"{_active_task_focus_block(active_tasks)}\n\n"
+            f"{_wake_action_bias_block(briefing.get('backend_wake_action_bias'))}\n\n"
             f"当前简报:\n{json.dumps(briefing, indent=2, ensure_ascii=False, default=str)}\n\n"
             f"记忆上下文:\n{json.dumps(memories, indent=2, ensure_ascii=False, default=str)}\n\n"
             f"{user_content_tail}"
@@ -1146,12 +1447,21 @@ class CognitiveLoop:
                             tool_args["output"] = tool_args[alias]
                             break
                     else:
-                        tool_args["output"] = _fallback_output_text(response.content, str(forced_tid))
+                        tool_args["output"] = _fallback_output_text(
+                            response.content,
+                            str(forced_tid),
+                            forced_task,
+                        )
                 if _looks_like_upstream_replay(tool_args.get("output"), forced_task):
                     logger.warning(
                         "LLM task_execute output replayed upstream content; replacing with delta guard output"
                     )
                     tool_args["output"] = _repair_replay_output(forced_task, str(forced_tid))
+                tool_args["output"] = _repair_contract_output_if_safe(
+                    tool_args.get("output"),
+                    forced_task,
+                    str(forced_tid),
+                )
                 tool_args.setdefault("success", True)
 
             return Decision(
@@ -1166,12 +1476,13 @@ class CognitiveLoop:
         if has_active:
             forced_tid = active_task_ids[0]
             forced_task = active_tasks[0] if active_tasks else None
-            output = _fallback_output_text(response.content, str(forced_tid))
+            output = _fallback_output_text(response.content, str(forced_tid), forced_task)
             if _looks_like_upstream_replay(output, forced_task):
                 logger.warning(
                     "LLM text fallback replayed upstream content; replacing with delta guard output"
                 )
                 output = _repair_replay_output(forced_task, str(forced_tid))
+            output = _repair_contract_output_if_safe(output, forced_task, str(forced_tid))
             return Decision(
                 action="task_execute",
                 params={
@@ -1699,6 +2010,18 @@ class CognitiveLoop:
         logger.info("WAKE(%s): %s → EVENT", reason, prev.value)
         if self._wake_event is not None:
             self._wake_event.set()
+
+    def record_wake_event(self, event: dict[str, Any]) -> None:
+        """Queue backend wake event metadata for the next Perceive phase."""
+        if not isinstance(event, dict):
+            return
+        self._pending_wake_events.append(dict(event))
+        del self._pending_wake_events[:-32]
+
+    def _drain_wake_events(self) -> list[dict[str, Any]]:
+        events = list(self._pending_wake_events)
+        self._pending_wake_events.clear()
+        return events
 
     def bind_wake_event(self, event: asyncio.Event) -> None:
         """Bind an asyncio.Event so ``wake()`` can interrupt sleep."""

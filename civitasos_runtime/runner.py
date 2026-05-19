@@ -394,13 +394,17 @@ class AgentRunner:
             endpoint = f"http://{host}:{port}"
 
         # Newer backends may require JWT even for A2A registration routes.
-        self._bootstrap_demo_jwt()
+        # Prefer DID auth when possible, otherwise use scoped service-token
+        # bootstrap before falling back to dev-only demo-login compatibility.
+        self._bootstrap_registration_jwt()
 
         if self._institutional_identity_enabled():
             logger.info(
                 "Institutional identity enabled — registering via birth-proposal"
             )
             self._register_via_birth_proposal(endpoint=endpoint)
+            self._save_identity_if_configured()
+            self._bootstrap_identity_jwt()
             return
 
         try:
@@ -409,8 +413,10 @@ class AgentRunner:
                 endpoint=endpoint,
                 description=f"Autonomous agent: {', '.join(self._capabilities)}",
             )
-            self._sync_registered_capabilities()
             logger.info("Agent registered via a2a_quickstart (endpoint=%s)", endpoint)
+            self._save_identity_if_configured()
+            self._bootstrap_identity_jwt()
+            self._sync_registered_capabilities()
         except Exception as exc:
             if self._is_sponsor_required_error(exc):
                 logger.warning(
@@ -418,6 +424,8 @@ class AgentRunner:
                     "falling back to birth-proposal"
                 )
                 self._register_via_birth_proposal(endpoint=endpoint)
+                self._save_identity_if_configured()
+                self._bootstrap_identity_jwt()
                 return
             logger.warning("a2a_quickstart failed, trying register()")
             try:
@@ -428,6 +436,8 @@ class AgentRunner:
                     stake=self._stake,
                 )
                 logger.info("Agent registered via register()")
+                self._save_identity_if_configured()
+                self._bootstrap_identity_jwt()
             except Exception as register_exc:
                 if self._is_sponsor_required_error(register_exc):
                     logger.warning(
@@ -435,6 +445,8 @@ class AgentRunner:
                         "falling back to birth-proposal"
                     )
                     self._register_via_birth_proposal(endpoint=endpoint)
+                    self._save_identity_if_configured()
+                    self._bootstrap_identity_jwt()
                     return
                 logger.exception("Agent registration failed entirely")
                 raise
@@ -459,6 +471,54 @@ class AgentRunner:
 
     def _institutional_identity_enabled(self) -> bool:
         return self._env_flag_enabled("CIVITASOS_INSTITUTIONAL_IDENTITY_ENABLED")
+
+    def _require_service_token_bootstrap(self) -> bool:
+        return any(
+            self._env_flag_enabled(name)
+            for name in (
+                "CIVITASOS_RUNTIME_REQUIRE_SERVICE_TOKEN_BOOTSTRAP",
+                "L1_REQUIRE_SERVICE_TOKEN",
+            )
+        )
+
+    @staticmethod
+    def _first_env_value(*names: str) -> str:
+        for name in names:
+            value = os.getenv(name, "").strip()
+            if value:
+                return value
+        return ""
+
+    def _service_token_bootstrap_secret(self) -> str:
+        return self._first_env_value(
+            "CIVITASOS_RUNTIME_SERVICE_TOKEN_SECRET",
+            "L1_SERVICE_TOKEN_SECRET",
+            "L1_PILOT_001_SERVICE_TOKEN_SECRET",
+            "CIVITASOS_SERVICE_TOKEN_SECRET",
+        )
+
+    def _service_token_bootstrap_service_id(self) -> str:
+        return (
+            self._first_env_value(
+                "CIVITASOS_RUNTIME_SERVICE_ID",
+                "L1_SERVICE_ID",
+                "L1_PILOT_001_SERVICE_ID",
+            )
+            or "runtime_birth_bootstrap"
+        )
+
+    def _service_token_bootstrap_scopes(self) -> list[str]:
+        raw = (
+            self._first_env_value(
+                "CIVITASOS_RUNTIME_SERVICE_TOKEN_SCOPES",
+                "L1_SERVICE_TOKEN_SCOPES",
+                "L1_PILOT_001_SERVICE_SCOPES",
+                "CIVITASOS_SERVICE_TOKEN_SCOPES",
+            )
+            or "agents:read,agents:write"
+        )
+        scopes = [scope.strip() for scope in raw.split(",") if scope.strip()]
+        return scopes or ["agents:read", "agents:write"]
 
     @staticmethod
     def _is_sponsor_required_error(exc: Exception) -> bool:
@@ -571,8 +631,147 @@ class AgentRunner:
             endpoint or "<default>",
         )
 
+    def _save_identity_if_configured(self) -> None:
+        """Persist post-registration DID so future runs can prove key control."""
+        if not self._identity_file:
+            return
+        save_identity = getattr(self._agent, "save_identity", None)
+        if not callable(save_identity):
+            return
+        try:
+            save_identity(self._identity_file)
+            logger.info("Identity updated after registration: %s", self._identity_file)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to update identity file after registration: %s", exc)
+
+    def _bootstrap_identity_jwt(self) -> bool:
+        """Prefer DID challenge auth when the registered identity can sign."""
+        authenticate = getattr(self._agent, "authenticate", None)
+        if not callable(authenticate):
+            return False
+        if not getattr(self._agent, "_agent_id", None):
+            return False
+        try:
+            try:
+                authenticate(allow_legacy_fallback=False)
+            except TypeError:
+                authenticate()
+            context = getattr(self._agent, "jwt_auth_context", None)
+            if callable(context):
+                context = context()
+            logger.info("DID auth token bootstrapped context=%s", context or "<unknown>")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("DID auth bootstrap skipped: %s", exc)
+            return False
+
+    def _bootstrap_registration_jwt(self) -> None:
+        """Bootstrap auth for registration without relying on demo-login first."""
+        if getattr(self._agent, "_jwt_token", None):
+            return
+        if self._bootstrap_identity_jwt():
+            return
+        if self._bootstrap_service_jwt():
+            return
+        if self._require_service_token_bootstrap():
+            raise RuntimeError(
+                "service-token bootstrap is required but no usable service token "
+                "could be obtained; set L1_SERVICE_TOKEN_SECRET or "
+                "CIVITASOS_RUNTIME_SERVICE_TOKEN_SECRET"
+            )
+        self._bootstrap_demo_jwt()
+
+    def _bootstrap_service_jwt(self) -> bool:
+        """Obtain a scoped non-production service token for registration bootstrap."""
+        secret = self._service_token_bootstrap_secret()
+        if not secret:
+            return False
+        service_id = self._service_token_bootstrap_service_id()
+        scopes = self._service_token_bootstrap_scopes()
+        authenticate_service_token = getattr(self._agent, "authenticate_service_token", None)
+        try:
+            if callable(authenticate_service_token):
+                authenticate_service_token(
+                    service_id=service_id,
+                    secret=secret,
+                    scopes=scopes,
+                )
+            else:
+                self._bootstrap_service_jwt_via_http(
+                    service_id=service_id,
+                    secret=secret,
+                    scopes=scopes,
+                )
+            context = getattr(self._agent, "jwt_auth_context", None)
+            if callable(context):
+                context = context()
+            logger.info(
+                "Service-token bootstrap token acquired service_id=%s scopes=%s context=%s",
+                service_id,
+                ",".join(scopes),
+                context or "<unknown>",
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if self._require_service_token_bootstrap():
+                raise RuntimeError(
+                    f"service-token bootstrap failed for service_id={service_id}: {exc}"
+                ) from exc
+            logger.debug("Service-token bootstrap skipped: %s", exc)
+            return False
+
+    def _bootstrap_service_jwt_via_http(
+        self,
+        *,
+        service_id: str,
+        secret: str,
+        scopes: list[str],
+    ) -> None:
+        """Fallback service-token bootstrap for older SDK instances."""
+        import json as _json
+        import time as _time
+        import urllib.request as _ur
+
+        base_url = str(
+            self._base_url[0] if isinstance(self._base_url, list) else self._base_url
+        ).rstrip("/")
+        req = _ur.Request(
+            f"{base_url}/api/v1/auth/service-token",
+            data=_json.dumps(
+                {
+                    "service_id": service_id,
+                    "secret": secret,
+                    "scopes": scopes,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=10) as resp:
+            body = _json.loads(resp.read().decode("utf-8"))
+        data = body.get("data", body) if isinstance(body, dict) else {}
+        token = data.get("token") or body.get("token")
+        if not token:
+            raise RuntimeError(f"service-token response missing token: {body}")
+        self._agent._jwt_token = token
+        expires_in = data.get("expires_in") or body.get("expires_in") or 3600
+        self._agent._jwt_expires_at = _time.time() + int(expires_in)
+        self._agent._jwt_auth_context = {
+            "auth_method": data.get("auth_method") or "service_token",
+            "production_allowed": bool(data.get("production_allowed", False)),
+            "evidence_allowed": bool(data.get("evidence_allowed", False)),
+        }
+        for key in ("service_id", "scopes", "role", "non_claims"):
+            if key in data:
+                self._agent._jwt_auth_context[key] = data[key]
+
     def _bootstrap_demo_jwt(self) -> None:
-        """Best-effort demo-login bootstrap for JWT-protected dev backends."""
+        """Best-effort bootstrap for JWT-protected dev backends.
+
+        Demo-login remains only as a dev/test compatibility fallback for
+        registration paths that require a bootstrap bearer before the DID exists
+        and no scoped service-token is configured.
+        """
         if getattr(self._agent, "_jwt_token", None):
             return
         candidates = [
@@ -606,6 +805,15 @@ class AgentRunner:
                 self._agent._jwt_token = token
                 expires_in = body.get("expires_in") or body.get("data", {}).get("expires_in") or 3600
                 self._agent._jwt_expires_at = _time.time() + int(expires_in)
+                self._agent._jwt_auth_context = {
+                    "auth_method": body.get("data", {}).get("auth_method") or "demo_login",
+                    "production_allowed": bool(
+                        body.get("data", {}).get("production_allowed", False)
+                    ),
+                    "evidence_allowed": bool(
+                        body.get("data", {}).get("evidence_allowed", False)
+                    ),
+                }
                 logger.info("Demo-login token bootstrapped for %s", cid)
                 return
             except Exception:
@@ -626,8 +834,8 @@ class AgentRunner:
             result = self._agent.webhook_register(
                 callback_url=wake_url,
                 events=[
-                    "task.posted", "task.claimed", "task.completed",
-                    "task.failed", "task.settled",
+                    "task.posted", "task.claimed", "task.delivered",
+                    "task.completed", "task.failed", "task.settled",
                 ],
             )
             self._webhook_sub_id = result.get("subscription_id")

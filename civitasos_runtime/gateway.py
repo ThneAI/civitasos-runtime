@@ -20,8 +20,11 @@ Economic Model:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -47,6 +50,9 @@ class GatewayConfig:
     delegate_surcharge: float = 2.0   # extra gas for LLM reasoning in delegate mode
     max_delegate_steps: int = 10      # max sequential actions per delegate request
     require_auth: bool = True         # enforce X-Civitas-DID header
+    wake_callback_secret: str | None = None
+    wake_callback_issuer: str = "civitasos-backend"
+    wake_signature_tolerance_secs: int = 300
 
 
 @dataclass
@@ -95,6 +101,94 @@ class Ledger:
                 for r in self._records[-20:]
             ],
         }
+
+
+def build_wake_signature(
+    secret: str,
+    timestamp: str,
+    raw_body: bytes,
+    *,
+    issuer: str = "civitasos-backend",
+) -> str:
+    """Build backend-compatible HMAC signature for wake callbacks."""
+    signed_payload = (
+        issuer.encode("utf-8")
+        + b"."
+        + timestamp.encode("utf-8")
+        + b"."
+        + raw_body
+    )
+    digest = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+def validate_wake_signature(
+    secret: str | None,
+    headers: Any,
+    raw_body: bytes,
+    *,
+    tolerance_secs: int = 300,
+    expected_issuer: str = "civitasos-backend",
+    now: float | None = None,
+) -> tuple[bool, str]:
+    """Validate optional backend wake callback HMAC.
+
+    If no secret is configured, wake callbacks remain compatibility-accepted.
+    When a secret is configured, missing, stale, or mismatched signatures fail.
+    """
+    if not secret:
+        return True, "signature_not_required"
+
+    issuer = headers.get("X-Civitas-Webhook-Issuer", "")
+    timestamp = headers.get("X-Civitas-Webhook-Timestamp", "")
+    signature = headers.get("X-Civitas-Webhook-Signature", "")
+    if not issuer or not timestamp or not signature:
+        return False, "missing_signature_headers"
+    if issuer != expected_issuer:
+        return False, "invalid_signature_issuer"
+    try:
+        observed = int(timestamp)
+    except ValueError:
+        return False, "invalid_signature_timestamp"
+    current = int(now if now is not None else time.time())
+    if abs(current - observed) > tolerance_secs:
+        return False, "stale_signature_timestamp"
+
+    expected = build_wake_signature(secret, timestamp, raw_body, issuer=issuer)
+    if not hmac.compare_digest(signature, expected):
+        return False, "signature_mismatch"
+    return True, "signature_valid"
+
+
+def build_wake_audit_context(headers: Any, body: dict[str, Any]) -> dict[str, Any]:
+    """Extract stable audit metadata from a wake callback without trusting it as auth."""
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    task_id = body.get("task_id") or data.get("task_id")
+    return {
+        "schema_version": "civitasos-wake-audit-context:v1",
+        "issuer": headers.get("X-Civitas-Webhook-Issuer", ""),
+        "event": body.get("event", "unknown"),
+        "task_id": task_id,
+        "subscription_id": body.get("subscription_id"),
+        "signature_present": bool(headers.get("X-Civitas-Webhook-Signature", "")),
+    }
+
+
+def build_wake_event_record(headers: Any, body: dict[str, Any]) -> dict[str, Any]:
+    """Build a structured event record for the next cognitive tick."""
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    audit = build_wake_audit_context(headers, body)
+    return {
+        "schema_version": "civitasos-wake-event-record:v1",
+        "event": audit["event"],
+        "task_id": audit["task_id"],
+        "agent_id": body.get("agent_id") or data.get("agent_id"),
+        "subscription_id": audit["subscription_id"],
+        "issuer": audit["issuer"],
+        "backend_timestamp": body.get("timestamp"),
+        "signature_present": audit["signature_present"],
+        "data": data,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +251,10 @@ class CivitasGateway:
         self._energy = energy
         self._llm = llm
         self._config = config or GatewayConfig()
+        if self._config.wake_callback_secret is None:
+            self._config.wake_callback_secret = (
+                os.getenv("CIVITASOS_WAKE_CALLBACK_SECRET", "").strip() or None
+            )
         self._ledger = Ledger()
         self._name = agent_name or "CivitasRuntime"
         self._capabilities = capabilities or []
@@ -248,15 +346,41 @@ class CivitasGateway:
         """
         from aiohttp import web
 
+        raw_body = await request.read()
+        ok, reason = validate_wake_signature(
+            self._config.wake_callback_secret,
+            request.headers,
+            raw_body,
+            tolerance_secs=self._config.wake_signature_tolerance_secs,
+            expected_issuer=self._config.wake_callback_issuer,
+        )
+        if not ok:
+            logger.warning("WAKE rejected: %s", reason)
+            raise web.HTTPUnauthorized(
+                text=json.dumps({"error": "invalid wake signature", "reason": reason}),
+                content_type="application/json",
+            )
+
         try:
-            body = await request.json()
+            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
         except Exception:
             body = {}
 
         event_type = body.get("event", "unknown")
-        logger.info("WAKE received: event=%s data_keys=%s", event_type, list(body.get("data", {}).keys()))
+        audit_context = build_wake_audit_context(request.headers, body)
+        event_record = build_wake_event_record(request.headers, body)
+        logger.info(
+            "WAKE received: event=%s task_id=%s issuer=%s data_keys=%s",
+            event_type,
+            audit_context.get("task_id"),
+            audit_context.get("issuer"),
+            list(body.get("data", {}).keys()),
+        )
 
         if self._cognitive_loop is not None:
+            record_wake_event = getattr(self._cognitive_loop, "record_wake_event", None)
+            if callable(record_wake_event):
+                record_wake_event(event_record)
             self._cognitive_loop.wake(reason=event_type)
         else:
             logger.warning("Wake received but no cognitive loop bound")

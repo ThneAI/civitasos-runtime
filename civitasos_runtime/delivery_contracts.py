@@ -40,9 +40,14 @@ _POSITIVE_PASS_STATUS_RE = re.compile(
     re.IGNORECASE,
 )
 _NEGATIVE_BOUNDARY_RE = re.compile(
-    r"(不通过|未通过|不就绪|未就绪|不授权|未授权|禁止|不能|不可|无|保持\s*blocked|blocked|not\s+ready|not\s+passed|no\s+production|does\s+not|fail|failed|fails)",
+    r"(不通过|未通过|不就绪|未就绪|不授权|未授权|不允许|未允许|"
+    r"禁止|严禁|不能|不可|不得|无|阻断|阻塞|隔离|未达成|未启用|未开放|未获得|未完成|"
+    r"未建立|不具备|不开放|不涉及|不触发|不进入|不进行|不声明|不声称|不产生|关闭|停用|"
+    r"保持\s*blocked|blocked|isolated|disabled|not\s+ready|not\s+passed|"
+    r"not\s+authorized|not\s+allowed|no\s+production|does\s+not|fail|failed|fails)",
     re.IGNORECASE,
 )
+_CLAIM_SEGMENT_SPLIT_RE = re.compile(r"(?:[\n。；;]+|\s+-\s+|\s+\d+[.、]\s*)")
 
 
 @dataclass(frozen=True)
@@ -240,14 +245,23 @@ def _contains_positive_h3_claim(text: str) -> bool:
         line = raw_line.strip()
         if not line or not _H3_CONTEXT_RE.search(line):
             continue
-        has_positive_boundary = bool(_POSITIVE_BOUNDARY_RE.search(line))
-        has_positive_pass_status = bool(_POSITIVE_PASS_STATUS_RE.search(line))
-        if not has_positive_boundary and not has_positive_pass_status:
-            continue
-        if _NEGATIVE_BOUNDARY_RE.search(line):
-            continue
-        return True
+        for segment in _claim_segments(line):
+            if not segment:
+                continue
+            segment_has_h3_context = _H3_CONTEXT_RE.search(segment) is not None
+            has_positive_pass_status = bool(_POSITIVE_PASS_STATUS_RE.search(segment))
+            has_positive_boundary = segment_has_h3_context and bool(_POSITIVE_BOUNDARY_RE.search(segment))
+            if not has_positive_boundary and not has_positive_pass_status:
+                continue
+            if _NEGATIVE_BOUNDARY_RE.search(segment):
+                continue
+            return True
     return False
+
+
+def _claim_segments(line: str) -> list[str]:
+    """Split dense LLM paragraphs so blocking clauses do not contaminate verdict clauses."""
+    return [segment.strip() for segment in _CLAIM_SEGMENT_SPLIT_RE.split(line) if segment.strip()]
 
 
 def _has_issue_list(text: str) -> bool:
