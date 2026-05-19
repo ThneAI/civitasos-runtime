@@ -581,15 +581,15 @@ def _build_wake_action_bias(
     """Build a deterministic action hint from backend wake events.
 
     The only automatic state-changing bias is a capability-matched
-    `task.posted -> pool_claim` when the agent has no active task. Other event
-    types remain observable context for the next LLM tick.
+    `task.posted -> pool_claim` when the agent has no active task. Delivery and
+    failure events become review/repair follow-up bias for the LLM prompt only;
+    they are intentionally not auto-executed.
     """
     events = briefing.get("backend_wake_events")
     if not isinstance(events, list) or not events:
         return None
     active_tasks = briefing.get("active_tasks")
-    if isinstance(active_tasks, list) and active_tasks:
-        return None
+    has_active_task = isinstance(active_tasks, list) and bool(active_tasks)
 
     agent_id = _briefing_agent_id(briefing)
     capability_set = _normalise_capability_set(
@@ -600,38 +600,92 @@ def _build_wake_action_bias(
         if not isinstance(event, dict):
             continue
         event_name = str(event.get("event") or "").strip()
-        if event_name != "task.posted":
-            continue
         data = _wake_event_data(event)
         task_id = _wake_event_task_id(event)
-        required = data.get("required_capability")
-        requester = str(data.get("requester") or "").strip()
         if not task_id:
             continue
-        if requester and agent_id and requester == agent_id:
-            continue
-        if not _capability_matches(required, capability_set):
-            continue
-        return {
-            "schema_version": "civitasos-wake-action-bias:v1",
-            "source_event": event_name,
-            "action": "pool_claim",
-            "task_id": task_id,
-            "required_capability": required,
-            "requester": requester,
-            "confidence": 0.92,
-            "reason": "backend task.posted event matches local capability and no active task is held",
-            "non_claims": [
-                "wake_bias_does_not_skip_conscience",
-                "wake_bias_does_not_execute_task_output",
-            ],
-        }
+        required = data.get("required_capability")
+        requester = str(data.get("requester") or "").strip()
+        worker = str(data.get("agent_id") or "").strip()
+
+        if event_name == "task.posted":
+            if has_active_task:
+                continue
+            if requester and agent_id and requester == agent_id:
+                continue
+            if not _capability_matches(required, capability_set):
+                continue
+            return {
+                "schema_version": "civitasos-wake-action-bias:v1",
+                "source_event": event_name,
+                "action": "pool_claim",
+                "task_id": task_id,
+                "required_capability": required,
+                "requester": requester,
+                "confidence": 0.92,
+                "reason": "backend task.posted event matches local capability and no active task is held",
+                "non_claims": [
+                    "wake_bias_does_not_skip_conscience",
+                    "wake_bias_does_not_execute_task_output",
+                ],
+            }
+
+        if event_name == "task.delivered":
+            return {
+                "schema_version": "civitasos-wake-action-bias:v1",
+                "source_event": event_name,
+                "action": "review_delivery",
+                "task_id": task_id,
+                "required_capability": required,
+                "requester": requester,
+                "worker_agent_id": worker,
+                "status": data.get("status") or "Delivered",
+                "confidence": 0.74,
+                "reason": "backend task.delivered event requires review/receipt/challenge-window awareness",
+                "followup_focus": [
+                    "inspect delivered output before confirmation or dispute",
+                    "preserve challenge window and requester/worker accountability",
+                    "post or claim an explicit review task if one exists; do not auto-confirm",
+                ],
+                "non_claims": [
+                    "delivery_wake_bias_does_not_confirm_or_dispute",
+                    "delivery_wake_bias_does_not_execute_task_output",
+                ],
+            }
+
+        if event_name == "task.failed":
+            return {
+                "schema_version": "civitasos-wake-action-bias:v1",
+                "source_event": event_name,
+                "action": "repair_or_review_failure",
+                "task_id": task_id,
+                "required_capability": required,
+                "requester": requester,
+                "worker_agent_id": worker,
+                "failure_reason": data.get("failure_reason") or data.get("reason") or "",
+                "confidence": 0.78,
+                "reason": "backend task.failed event requires failure review and explicit repair planning",
+                "followup_focus": [
+                    "identify the failed contract or execution boundary",
+                    "preserve relation failure memory before proposing repair",
+                    "post or claim an explicit repair/review task if one exists; do not silently retry",
+                ],
+                "non_claims": [
+                    "failure_wake_bias_does_not_auto_retry",
+                    "failure_wake_bias_does_not_authorize_repair_delivery",
+                ],
+            }
     return None
 
 
 def _wake_action_bias_block(bias: dict[str, Any] | None) -> str:
     if not isinstance(bias, dict) or not bias:
         return ""
+    followup = bias.get("followup_focus")
+    followup_lines = ""
+    if isinstance(followup, list) and followup:
+        followup_lines = "\n".join(f"- followup: {item}" for item in followup)
+        followup_lines = f"\n{followup_lines}\n"
     return (
         "Backend wake action bias（结构化事件优先级）:\n"
         f"- source_event: {bias.get('source_event')}\n"
@@ -639,8 +693,9 @@ def _wake_action_bias_block(bias: dict[str, Any] | None) -> str:
         f"- task_id: {bias.get('task_id')}\n"
         f"- required_capability: {bias.get('required_capability')}\n"
         f"- reason: {bias.get('reason')}\n"
+        f"{followup_lines}"
         "要求: 该 bias 仍需经过 conscience / scope / backend 状态机校验；"
-        "不得把它当成生产授权或交付完成证明。"
+        "不得把它当成生产授权、自动确认/争议、自动重试或交付完成证明。"
     )
 
 
@@ -1055,10 +1110,20 @@ class CognitiveLoop:
         )
         ctx.decision = Decision(
             action="pool_fail",
-            params={"task_id": task_id},
+            params={
+                "task_id": task_id,
+                "_delivery_contract_verification": report,
+                "_repair_suggestions": report.get("repair_suggestions", []),
+            },
             reasoning=(
                 "delivery contract blocked task_execute: "
                 + "; ".join(verification.failure_reasons)
+                + (
+                    " | repair suggestions: "
+                    + "; ".join(verification.repair_suggestions)
+                    if verification.repair_suggestions
+                    else ""
+                )
             ),
             confidence=1.0,
             source=DecisionSource.HYBRID,

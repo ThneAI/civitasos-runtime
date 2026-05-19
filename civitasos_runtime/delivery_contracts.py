@@ -68,12 +68,14 @@ class DeliveryVerification:
 
     passed: bool
     failure_reasons: tuple[str, ...] = ()
+    repair_suggestions: tuple[str, ...] = ()
     contract: TaskContract = field(default_factory=lambda: TaskContract(active=False))
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "failure_reasons": list(self.failure_reasons),
+            "repair_suggestions": list(self.repair_suggestions),
             "contract": {
                 "active": self.contract.active,
                 "required_sections": list(self.contract.required_sections),
@@ -153,8 +155,32 @@ def verify_task_delivery(task: dict[str, Any] | None, output: Any) -> DeliveryVe
     return DeliveryVerification(
         passed=not reasons,
         failure_reasons=tuple(reasons),
+        repair_suggestions=tuple(_repair_suggestions(reasons)),
         contract=contract,
     )
+
+
+def _repair_suggestions(failure_reasons: list[str]) -> list[str]:
+    suggestions: list[str] = []
+    for reason in failure_reasons:
+        if reason == "output is empty":
+            suggestions.append("Provide substantive task output instead of an empty result.")
+        elif reason.startswith("missing required section: "):
+            section = reason.split(": ", 1)[1]
+            suggestions.append(f"Add a dedicated section named `{section}` with task-specific content.")
+        elif reason == "output replays upstream content":
+            suggestions.append(
+                "Rewrite as a delta: cite upstream only as reference and state concrete differences."
+            )
+        elif reason == "output makes a positive H3/production authorization claim":
+            suggestions.append(
+                "Replace positive H.3/production claims with an explicit blocked/no-authorization boundary."
+            )
+        elif reason == "review output lacks an issue list":
+            suggestions.append(
+                "Add `问题清单` / `Findings` with concrete issues or an explicit no-new-issues statement."
+            )
+    return suggestions
 
 
 def _default_required_sections(

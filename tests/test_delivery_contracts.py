@@ -73,12 +73,14 @@ def test_implementation_contract_requires_delta_sections_and_blocks_replay() -> 
 
     assert replay.passed is False
     assert "output replays upstream content" in replay.failure_reasons
+    assert any("Rewrite as a delta" in suggestion for suggestion in replay.repair_suggestions)
 
     missing = verify_task_delivery(_implementation_task(), "H3 remains blocked.")
 
     assert missing.passed is False
     assert "missing required section: 变更摘要" in missing.failure_reasons
     assert "missing required section: 与上游不同之处" in missing.failure_reasons
+    assert "Add a dedicated section named `变更摘要` with task-specific content." in missing.repair_suggestions
 
     ok = verify_task_delivery(
         _implementation_task(),
@@ -96,6 +98,7 @@ def test_h3_contract_blocks_positive_production_authorization_claims() -> None:
 
     assert report.passed is False
     assert "output makes a positive H3/production authorization claim" in report.failure_reasons
+    assert any("blocked/no-authorization boundary" in suggestion for suggestion in report.repair_suggestions)
 
 
 def test_h3_contract_does_not_treat_through_as_pass_status() -> None:
@@ -254,5 +257,8 @@ def test_loop_rewrites_invalid_task_execute_to_pool_fail() -> None:
     loop._enforce_delivery_contract(ctx)
 
     assert ctx.decision.action == "pool_fail"
-    assert ctx.decision.params == {"task_id": "task-1"}
+    assert ctx.decision.params["task_id"] == "task-1"
+    assert "_repair_suggestions" in ctx.decision.params
+    assert any("Rewrite as a delta" in suggestion for suggestion in ctx.decision.params["_repair_suggestions"])
     assert ctx.briefing["delivery_contract_violations"][0]["passed"] is False
+    assert ctx.briefing["delivery_contract_violations"][0]["repair_suggestions"]

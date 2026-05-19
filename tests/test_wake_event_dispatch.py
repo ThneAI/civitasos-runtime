@@ -168,3 +168,61 @@ def test_task_posted_wake_matches_briefing_capability_objects() -> None:
 
     assert briefing["backend_wake_action_bias"]["action"] == "pool_claim"
     assert briefing["backend_wake_action_bias"]["task_id"] == "task-boundary-1"
+
+
+def test_task_delivered_wake_builds_review_followup_bias_without_autodecision() -> None:
+    loop = CognitiveLoop(_Agent(), llm=_LLM(), capabilities=["review"])
+    loop.record_wake_event(
+        {
+            "event": "task.delivered",
+            "task_id": "task-delivered-1",
+            "data": {
+                "task_id": "task-delivered-1",
+                "requester": "did:civ:test:requester",
+                "agent_id": "did:civ:test:worker",
+                "required_capability": "implementation",
+                "status": "Delivered",
+            },
+        }
+    )
+
+    briefing = asyncio.run(loop._perceive())
+
+    assert briefing["backend_wake_action_bias"]["action"] == "review_delivery"
+    assert briefing["backend_wake_action_bias"]["source_event"] == "task.delivered"
+    assert briefing["backend_wake_action_bias"]["task_id"] == "task-delivered-1"
+    assert "inspect delivered output before confirmation or dispute" in briefing[
+        "backend_wake_action_bias"
+    ]["followup_focus"]
+    assert loop._decision_from_wake_action_bias(briefing) is None
+
+
+def test_task_failed_wake_builds_repair_followup_bias_even_with_active_tasks() -> None:
+    class AgentWithActiveTask(_Agent):
+        def briefing(self) -> dict:
+            briefing = super().briefing()
+            briefing["active_tasks"] = [{"task_id": "active-1"}]
+            return briefing
+
+    loop = CognitiveLoop(AgentWithActiveTask(), llm=_LLM(), capabilities=["repair"])
+    loop.record_wake_event(
+        {
+            "event": "task.failed",
+            "task_id": "task-failed-1",
+            "data": {
+                "task_id": "task-failed-1",
+                "requester": "did:civ:test:requester",
+                "agent_id": "did:civ:test:worker",
+                "required_capability": "repair",
+                "failure_reason": "delivery contract violation",
+            },
+        }
+    )
+
+    briefing = asyncio.run(loop._perceive())
+
+    assert briefing["backend_wake_action_bias"]["action"] == "repair_or_review_failure"
+    assert briefing["backend_wake_action_bias"]["source_event"] == "task.failed"
+    assert briefing["backend_wake_action_bias"]["failure_reason"] == "delivery contract violation"
+    assert "do not silently retry" in briefing["backend_wake_action_bias"]["followup_focus"][-1]
+    assert loop._decision_from_wake_action_bias(briefing) is None
