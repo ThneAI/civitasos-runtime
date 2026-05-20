@@ -14,6 +14,21 @@ class _FakeAgent:
     def webhook_unregister(self, subscription_id: str) -> dict:
         return {}
 
+    def ask_guardian(self, action: str) -> dict:
+        return {"action": action}
+
+    def pool_discover(
+        self,
+        capability: str | None = None,
+        capabilities: list[str] | None = None,
+        min_reputation: float = 0.0,
+    ) -> list[dict]:
+        return [{
+            "capability": capability,
+            "capabilities": capabilities,
+            "min_reputation": min_reputation,
+        }]
+
     def task_execute(self, task_id: str, output: str, success: bool = True) -> dict:
         return {}
 
@@ -29,6 +44,7 @@ def test_webhook_lifecycle_methods_are_not_exposed_to_llm() -> None:
     assert "task_execute" in tool_names
     assert "webhook_register" not in tool_names
     assert "webhook_unregister" not in tool_names
+    assert "ask_guardian" not in tool_names
 
 
 def test_task_execute_result_alias_is_normalized_to_output() -> None:
@@ -47,6 +63,26 @@ def test_task_execute_result_alias_is_normalized_to_output() -> None:
         "task_id": "task-1",
         "output": "implementation delta",
     }
+
+
+def test_array_schema_and_string_args_are_normalized() -> None:
+    agent = _FakeAgent()
+    registry = ToolRegistry(agent)
+    pool_discover = next(
+        item for item in registry.to_openai_tools()
+        if item["function"]["name"] == "pool_discover"
+    )
+
+    assert pool_discover["function"]["parameters"]["properties"]["capabilities"]["type"] == "array"
+
+    assert ToolRegistry._filter_params(
+        agent.pool_discover,
+        {"capabilities": "implementation, documentation, repair"},
+    )["capabilities"] == ["implementation", "documentation", "repair"]
+    assert ToolRegistry._filter_params(
+        agent.pool_discover,
+        {"capabilities": '["review","boundary_check","audit"]'},
+    )["capabilities"] == ["review", "boundary_check", "audit"]
 
 
 def test_active_task_replay_guard_detects_nested_upstream_result() -> None:

@@ -7,28 +7,13 @@ definitions that the LLM can invoke via function calling.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 from typing import Any, Callable
 
 from .models import ToolDef
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Parameter type → JSON Schema type mapping
-# ---------------------------------------------------------------------------
-
-_PY_TO_JSON: dict[str, str] = {
-    "str": "string",
-    "int": "integer",
-    "float": "number",
-    "bool": "boolean",
-    "list": "array",
-    "dict": "object",
-    "List": "array",
-    "Dict": "object",
-    "Optional": "string",  # fallback
-}
 
 # Methods to skip when auto-discovering SDK tools
 _SKIP_METHODS = frozenset({
@@ -39,6 +24,11 @@ _SKIP_METHODS = frozenset({
     # Event wakeup is managed by AgentRunner. Exposing these to the LLM causes
     # malformed event subscriptions and does not help task execution.
     "webhook_register", "webhook_unregister",
+    # Legacy SDK facade helpers depend on delegate_task, which is not available
+    # on the current CivitasAgent surface. Keeping them exposed makes external
+    # models pick dead-end tools instead of pool/read/execute actions.
+    "ask_guardian", "find_best_agent", "negotiate_chain",
+    "post_to_marketplace", "query_reputation",
     "refresh_token", "list_system_agents",
     # Worker pattern (we ARE the loop)
     "start_worker", "stop_worker", "task_handler",
@@ -85,24 +75,86 @@ def _classify(name: str) -> tuple[str, bool, float]:
     return "general", False, 1.0
 
 
+def _annotation_text(annotation: Any) -> str:
+    if annotation == inspect.Parameter.empty:
+        return ""
+    return str(annotation)
+
+
+def _annotation_json_type(annotation: Any) -> str:
+    type_name = _annotation_text(annotation)
+    if not type_name:
+        return "string"
+
+    lower = type_name.lower()
+    # Container types must be detected before scalar item types. For example
+    # Optional[List[str]] contains "str", but the function schema must be array.
+    if any(
+        marker in lower
+        for marker in ("list[", "list,", "typing.list", "sequence[", "tuple[", "set[")
+    ):
+        return "array"
+    if any(
+        marker in lower
+        for marker in ("dict[", "dict,", "typing.dict", "mapping[")
+    ):
+        return "object"
+    if "bool" in lower:
+        return "boolean"
+    if "int" in lower:
+        return "integer"
+    if "float" in lower:
+        return "number"
+    if "str" in lower:
+        return "string"
+    return "string"
+
+
 def _param_schema(param: inspect.Parameter) -> dict[str, Any]:
     """Convert a single inspect.Parameter to a JSON Schema property."""
-    annotation = param.annotation
-    json_type = "string"  # default
-    if annotation != inspect.Parameter.empty:
-        type_name = getattr(annotation, "__name__", str(annotation))
-        # Handle Optional[X] / X | None
-        for key, val in _PY_TO_JSON.items():
-            if key in type_name:
-                json_type = val
-                break
-
-    schema: dict[str, Any] = {"type": json_type}
+    schema: dict[str, Any] = {"type": _annotation_json_type(param.annotation)}
 
     if param.default not in (inspect.Parameter.empty, None):
         schema["default"] = param.default
 
     return schema
+
+
+def _param_expects_array(name: str, param: inspect.Parameter) -> bool:
+    if name == "capabilities":
+        return True
+    return _annotation_json_type(param.annotation) == "array"
+
+
+def _normalize_param_value(name: str, param: inspect.Parameter, value: Any) -> Any:
+    if _param_expects_array(name, param):
+        return _normalize_array_value(value)
+    return value
+
+
+def _normalize_array_value(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    if not isinstance(value, str):
+        return [value]
+
+    text = value.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return parsed
+        if parsed not in (None, ""):
+            return [parsed]
+    return [item.strip() for item in text.split(",") if item.strip()]
 
 
 class ToolRegistry:
@@ -238,10 +290,12 @@ class ToolRegistry:
         )
         if accepts_var_kw:
             return dict(params)
-        accepted = {n for n, p in sig.parameters.items()
-                    if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                                  inspect.Parameter.KEYWORD_ONLY)
-                    and n != "self"}
+        accepted = {
+            n: p for n, p in sig.parameters.items()
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                          inspect.Parameter.KEYWORD_ONLY)
+            and n != "self"
+        }
         cleaned: dict[str, Any] = {}
         dropped: list[str] = []
         fn_name = getattr(fn, "__name__", "")
@@ -253,7 +307,7 @@ class ToolRegistry:
                     break
         for k, v in params.items():
             if k in accepted:
-                cleaned[k] = v
+                cleaned[k] = _normalize_param_value(k, accepted[k], v)
             elif k.startswith("_"):
                 # Internal control metadata used by benchmark/rules path.
                 # Never forward to SDK calls and do not warn as hallucination.
