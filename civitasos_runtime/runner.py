@@ -10,6 +10,8 @@ import logging
 import os
 import pathlib
 import signal
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .conscience import Conscience
@@ -66,6 +68,8 @@ class AgentRunner:
         self._shutting_down = False
         self._cleanup_done = False
         self._start_running = False
+        self._runtime_instance_id = uuid.uuid4().hex
+        self._runtime_started_at = datetime.now(timezone.utc).isoformat()
         self._identity_file = identity_file
         self._endpoint_url = endpoint_url
         self._data_dir = data_dir or "data"
@@ -287,11 +291,21 @@ class AgentRunner:
         # Save shutdown state
         if self._memory:
             try:
-                self._memory.remember("shutdown_state", {
-                    "tick_count": self._loop.tick_count if self._loop else 0,
-                    "mode": self._loop.mode.value if self._loop else "unknown",
-                    "clean_shutdown": True,
-                })
+                identity = self._identity_continuity_anchor()
+                self._memory.remember(
+                    "shutdown_state",
+                    {
+                        "schema_version": "runtime-shutdown-state:v2",
+                        "runtime_instance_id": self._runtime_instance_id,
+                        "runtime_started_at": self._runtime_started_at,
+                        "shutdown_at": datetime.now(timezone.utc).isoformat(),
+                        "agent_id": identity["agent_id"],
+                        "public_key_hex": identity["public_key_hex"],
+                        "tick_count": self._loop.tick_count if self._loop else 0,
+                        "mode": self._loop.mode.value if self._loop else "unknown",
+                        "clean_shutdown": True,
+                    },
+                )
             except Exception:
                 pass
 
@@ -360,13 +374,53 @@ class AgentRunner:
                 await asyncio.sleep(step)
                 remaining -= step
 
-    async def _recover(self) -> None:
+    async def _recover(self) -> dict[str, Any] | None:
         """Check for crash recovery state from previous run."""
         if not self._memory:
-            return
+            return None
         try:
             state = self._memory.recall("shutdown_state")
-            if state and not state.get("clean_shutdown"):
+            if not isinstance(state, dict):
+                return None
+
+            identity = self._identity_continuity_anchor()
+            prior_agent_id = str(state.get("agent_id") or "")
+            prior_public_key = str(state.get("public_key_hex") or "")
+            current_agent_id = identity["agent_id"]
+            current_public_key = identity["public_key_hex"]
+            agent_id_continuous = bool(
+                prior_agent_id and current_agent_id and prior_agent_id == current_agent_id
+            )
+            public_key_continuous = bool(
+                prior_public_key
+                and current_public_key
+                and prior_public_key == current_public_key
+            )
+            evidence = {
+                "schema_version": "runtime-restart-continuity:v1",
+                "previous_runtime_instance_id": state.get("runtime_instance_id"),
+                "current_runtime_instance_id": self._runtime_instance_id,
+                "previous_runtime_started_at": state.get("runtime_started_at"),
+                "previous_shutdown_at": state.get("shutdown_at"),
+                "recovered_at": datetime.now(timezone.utc).isoformat(),
+                "previous_clean_shutdown": bool(state.get("clean_shutdown")),
+                "agent_id": current_agent_id,
+                "public_key_hex": current_public_key,
+                "agent_id_continuous": agent_id_continuous,
+                "public_key_continuous": public_key_continuous,
+                "identity_continuous": agent_id_continuous and public_key_continuous,
+                "previous_tick_count": state.get("tick_count"),
+                "previous_mode": state.get("mode"),
+            }
+            self._memory.remember("restart_continuity_state", evidence)
+
+            if not evidence["identity_continuous"]:
+                logger.error(
+                    "Restart identity continuity failed: prior_agent=%s current_agent=%s",
+                    prior_agent_id or "<missing>",
+                    current_agent_id or "<missing>",
+                )
+            elif not state.get("clean_shutdown"):
                 logger.warning(
                     "Recovering from unclean shutdown (last tick_count=%s)",
                     state.get("tick_count"),
@@ -381,8 +435,31 @@ class AgentRunner:
                         )
                 except Exception:
                     pass
+            else:
+                logger.info(
+                    "Recovered continuous identity from runtime instance %s",
+                    state.get("runtime_instance_id") or "<legacy>",
+                )
+            return evidence
         except Exception:
-            pass  # No saved state — fresh start
+            return None  # No saved state — fresh start
+
+    def _identity_continuity_anchor(self) -> dict[str, str]:
+        """Return non-secret identity material suitable for restart evidence."""
+        if self._agent is None:
+            return {"agent_id": "", "public_key_hex": ""}
+        return {
+            "agent_id": str(
+                getattr(self._agent, "agent_id", None)
+                or getattr(self._agent, "_agent_id", None)
+                or ""
+            ),
+            "public_key_hex": str(
+                getattr(self._agent, "public_key_hex", None)
+                or getattr(self._agent, "_public_key_hex", None)
+                or ""
+            ),
+        }
 
     async def _register(self) -> None:
         """Register the agent on the CivitasOS network."""
