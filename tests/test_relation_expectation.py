@@ -67,7 +67,7 @@ def test_failure_refs_generate_directed_relation_expectation() -> None:
     assert len(bias["reason_event_ids"]) == 2
 
     training = ctx.briefing["h0_relation_training_invariants"]
-    assert training["schema_version"] == "h0g_relation_training.v1"
+    assert training["schema_version"] == "h0g_relation_training.v2"
     assert training["training_sample_present"] is True
     assert training["negative_sample_present"] is True
     assert training["negative_fast_learning_present"] is True
@@ -75,6 +75,11 @@ def test_failure_refs_generate_directed_relation_expectation() -> None:
     assert training["history_preserved_present"] is True
     assert training["deltas"]["expected_trust"] < 0
     assert training["deltas"]["expected_betrayal_risk"] > 0
+    provenance = training["learning_provenance"]
+    assert provenance["schema_version"] == "relation-learning-provenance:v1"
+    assert provenance["source_event_ids"]
+    assert provenance["components"]
+    assert provenance["per_step_abs_caps"]["expected_trust"] == 0.18
 
     changed = {
         update.parameter_name: update
@@ -117,9 +122,9 @@ def test_repair_refs_recover_slowly_without_erasing_history() -> None:
     assert training["repair_sample_present"] is True
     assert training["repair_slow_recovery_present"] is True
     assert training["history_preserved_present"] is True
-    assert training["learning_rates"]["expected_trust"]["repair"] < (
-        training["learning_rates"]["expected_trust"]["negative"]
-    )
+    provenance = training["learning_provenance"]
+    assert provenance["components"][0]["outcome_kind"] == "settlement_confirmed"
+    assert provenance["applied_deltas"]["expected_trust"] > 0
 
 
 def test_failure_and_repair_refs_preserve_both_training_paths() -> None:
