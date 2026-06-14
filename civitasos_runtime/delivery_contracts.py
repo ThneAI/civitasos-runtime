@@ -275,8 +275,10 @@ def _contains_positive_h3_claim(text: str) -> bool:
             if not segment:
                 continue
             segment_has_h3_context = _H3_CONTEXT_RE.search(segment) is not None
+            if not segment_has_h3_context:
+                continue
             has_positive_pass_status = bool(_POSITIVE_PASS_STATUS_RE.search(segment))
-            has_positive_boundary = segment_has_h3_context and bool(_POSITIVE_BOUNDARY_RE.search(segment))
+            has_positive_boundary = bool(_POSITIVE_BOUNDARY_RE.search(segment))
             if not has_positive_boundary and not has_positive_pass_status:
                 continue
             if _NEGATIVE_BOUNDARY_RE.search(segment):

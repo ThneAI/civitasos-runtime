@@ -151,6 +151,20 @@ def test_h3_contract_accepts_chinese_explicit_prohibition_wording() -> None:
     assert report.passed is True
 
 
+def test_h3_contract_ignores_unrelated_pass_status_in_dense_single_line_output() -> None:
+    report = verify_task_delivery(
+        _planning_task(),
+        (
+            "## 任务边界 L1 受控试点只处理内部测试数据。 "
+            "## 执行计划 完成输入校验，通过分步验证确认内部结果。 "
+            "## H3 H.3 remains blocked; no production readiness; "
+            "no production runtime execution; no production receipt writes."
+        ),
+    )
+
+    assert report.passed is True
+
+
 def test_h3_contract_blocks_chinese_pass_status_claims() -> None:
     report = verify_task_delivery(
         _review_task(),
