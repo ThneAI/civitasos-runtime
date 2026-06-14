@@ -48,6 +48,14 @@ _NEGATIVE_BOUNDARY_RE = re.compile(
     re.IGNORECASE,
 )
 _CLAIM_SEGMENT_SPLIT_RE = re.compile(r"(?:[\n。；;]+|\s+-\s+|\s+\d+[.、]\s*)")
+_H3_MARKDOWN_HEADING_RE = re.compile(r"(?i)(?<!\S)#{1,6}\s*H\.?3\b")
+_MARKDOWN_HEADING_RE = re.compile(r"(?i)(?<!\S)#{1,6}\s+\S")
+_CANONICAL_H3_BOUNDARY = (
+    "## H3\n"
+    "System-owned boundary attestation: H.3 remains blocked; "
+    "no production readiness; no production runtime execution authorization; "
+    "no production receipt writes."
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +67,7 @@ class TaskContract:
     forbidden_claims: tuple[str, ...] = ()
     forbid_upstream_replay: bool = False
     h3_must_remain_blocked: bool = False
+    canonical_h3_boundary: bool = False
     review_must_have_issue_list: bool = False
 
 
@@ -82,6 +91,7 @@ class DeliveryVerification:
                 "forbidden_claims": list(self.contract.forbidden_claims),
                 "forbid_upstream_replay": self.contract.forbid_upstream_replay,
                 "h3_must_remain_blocked": self.contract.h3_must_remain_blocked,
+                "canonical_h3_boundary": self.contract.canonical_h3_boundary,
                 "review_must_have_issue_list": self.contract.review_must_have_issue_list,
             },
         }
@@ -128,8 +138,37 @@ def build_task_contract(task: dict[str, Any] | None) -> TaskContract:
         forbidden_claims=forbidden_claims,
         forbid_upstream_replay=bool(explicit_contract.get("forbid_upstream_replay", True)),
         h3_must_remain_blocked=bool(explicit_contract.get("h3_must_remain_blocked", has_h3_context)),
+        canonical_h3_boundary=bool(explicit_contract.get("canonical_h3_boundary", False)),
         review_must_have_issue_list=bool(explicit_contract.get("review_must_have_issue_list", is_review)),
     )
+
+
+def canonicalize_task_delivery_boundary(
+    task: dict[str, Any] | None,
+    output: Any,
+) -> tuple[Any, bool]:
+    """Replace an explicitly system-owned H3 section with a fixed attestation.
+
+    The opt-in contract flag keeps ordinary H3 review output fail-closed. Only
+    controlled tasks that declare the H3 section system-owned may remove model
+    wording from that section; positive production claims elsewhere remain
+    visible to the normal verifier.
+    """
+    contract = build_task_contract(task)
+    if not contract.canonical_h3_boundary or not isinstance(output, str):
+        return output, False
+
+    h3_heading = _H3_MARKDOWN_HEADING_RE.search(output)
+    if h3_heading is None:
+        return output, False
+
+    next_heading = _MARKDOWN_HEADING_RE.search(output, h3_heading.end())
+    section_end = next_heading.start() if next_heading else len(output)
+    prefix = output[: h3_heading.start()].rstrip()
+    suffix = output[section_end:].lstrip()
+    parts = [part for part in (prefix, _CANONICAL_H3_BOUNDARY, suffix) if part]
+    canonicalized = "\n\n".join(parts)
+    return canonicalized, canonicalized != output
 
 
 def verify_task_delivery(task: dict[str, Any] | None, output: Any) -> DeliveryVerification:

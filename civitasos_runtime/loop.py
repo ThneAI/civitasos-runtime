@@ -19,7 +19,11 @@ from typing import Any
 from urllib.parse import quote
 
 from .conscience import Conscience
-from .delivery_contracts import build_task_contract, verify_task_delivery
+from .delivery_contracts import (
+    build_task_contract,
+    canonicalize_task_delivery_boundary,
+    verify_task_delivery,
+)
 from .energy import Energy
 from .iem_anchor import build_iem_anchor, genesis_iem_state
 from .identity_expectation import apply_identity_expectation_traces, apply_iem_updates_to_state
@@ -383,6 +387,20 @@ def _repair_contract_output_if_safe(
     task_id: str,
 ) -> Any:
     """Repair shape-only contract failures while preserving semantic fail-closed rules."""
+    original_output = output
+    output, boundary_canonicalized = canonicalize_task_delivery_boundary(task, output)
+    if boundary_canonicalized:
+        original_text = (
+            original_output
+            if isinstance(original_output, str)
+            else json.dumps(original_output, ensure_ascii=False, sort_keys=True, default=str)
+        )
+        logger.warning(
+            "Canonicalized system-owned H3 boundary for %s; original_sha256=%s",
+            task_id,
+            hashlib.sha256(original_text.encode("utf-8")).hexdigest(),
+        )
+
     verification = verify_task_delivery(task, output)
     if verification.passed or not verification.contract.active:
         return output

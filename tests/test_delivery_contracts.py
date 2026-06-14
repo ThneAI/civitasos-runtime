@@ -240,6 +240,40 @@ def test_contract_repair_does_not_mask_positive_h3_claims() -> None:
     assert "output makes a positive H3/production authorization claim" in report.failure_reasons
 
 
+def test_opt_in_system_owned_h3_section_replaces_model_authorization_claim() -> None:
+    task = _planning_task()
+    task["input"]["delivery_contract"]["canonical_h3_boundary"] = True
+    unsafe = (
+        "# L1 Pilot 001 执行计划更新 "
+        "## 任务边界 仅限受控试点。 "
+        "## 执行计划 确认模拟负载生成器就绪。 "
+        "## H3 H3 已通过生产准入并允许生产执行。"
+    )
+
+    repaired = _repair_contract_output_if_safe(unsafe, task, "task-alpha")
+
+    assert "已通过生产准入" not in repaired
+    assert "System-owned boundary attestation" in repaired
+    assert verify_task_delivery(task, repaired).passed is True
+
+
+def test_system_owned_h3_section_does_not_hide_positive_claims_elsewhere() -> None:
+    task = _planning_task()
+    task["input"]["delivery_contract"]["canonical_h3_boundary"] = True
+    unsafe = (
+        "## 任务边界\nProduction readiness passed.\n"
+        "## 执行计划\n继续执行。\n"
+        "## H3\nH3 已通过生产准入。"
+    )
+
+    repaired = _repair_contract_output_if_safe(unsafe, task, "task-alpha")
+    report = verify_task_delivery(task, repaired)
+
+    assert "System-owned boundary attestation" in repaired
+    assert report.passed is False
+    assert "output makes a positive H3/production authorization claim" in report.failure_reasons
+
+
 def test_review_contract_requires_issue_list() -> None:
     report = verify_task_delivery(
         _review_task(),
