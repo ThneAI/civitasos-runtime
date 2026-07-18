@@ -56,7 +56,15 @@ class _StartProbeRunner(AgentRunner):
         return None
 
 
-def _runner(tmp_path, store, client, signer, *, restore_on_start):  # noqa: ANN001
+def _runner(
+    tmp_path,
+    store,
+    client,
+    signer,
+    *,
+    restore_on_start,
+    observer=None,
+):  # noqa: ANN001
     runner = AgentRunner(
         llm=SimpleNamespace(),
         data_dir=str(tmp_path / "memory"),
@@ -64,6 +72,7 @@ def _runner(tmp_path, store, client, signer, *, restore_on_start):  # noqa: ANN0
         restore_checkpoint_on_start=restore_on_start,
         checkpoint_backend_client=client,
         checkpoint_signer=signer,
+        checkpoint_restore_observer=observer,
     )
     runner._agent = _RunnerAgent(signer)
     runner._memory = HybridMemory(agent=None, data_dir=tmp_path / "memory")
@@ -91,6 +100,52 @@ def test_runner_restores_before_ticks_and_releases_only_after_activation(tmp_pat
     assert runner.checkpoint_latch.blocked is False
     assert runner.checkpoint_latch.activation["checkpoint_id"] == record["checkpoint_id"]
     assert runner._memory.local_store.snapshot() == expected
+    runner._memory.close()
+
+
+def test_runner_emits_only_bound_restore_milestones_in_durable_order(tmp_path) -> None:
+    signer = _Signer()
+    transport = _BackendTransport(signer)
+    store, memory, client, manifest = _active_checkpoint(tmp_path, transport)
+    memory.close()
+    events = []
+    runner = _runner(
+        tmp_path,
+        store,
+        client,
+        signer,
+        restore_on_start=True,
+        observer=lambda milestone, event: events.append((milestone, event)),
+    )
+
+    runner._restore_checkpoint_before_ticks()
+
+    assert [milestone for milestone, _event in events] == [
+        "runtime_intent_durable",
+        "backend_preflight_durable",
+        "runtime_restore_journal_durable",
+        "runtime_sqlite_committed",
+        "runtime_applied_journal_durable",
+        "backend_activation_durable",
+        "runtime_activation_journal_durable",
+        "runtime_intent_activated_durable",
+        "runtime_tick_latch_released",
+    ]
+    allowed = {
+        "schema_version",
+        "milestone",
+        "checkpoint_id",
+        "manifest_hash",
+        "sequence",
+        "identity_id",
+        "node_id",
+        "status",
+        "backend_status",
+        "activation_fact_id",
+    }
+    assert all(set(event) <= allowed for _milestone, event in events)
+    assert all(event["checkpoint_id"] == manifest["checkpoint_id"] for _, event in events)
+    assert all("owner-jwt" not in str(event) for _, event in events)
     runner._memory.close()
 
 

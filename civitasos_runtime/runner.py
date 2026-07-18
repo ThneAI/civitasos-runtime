@@ -17,6 +17,11 @@ from typing import Any, Callable, NoReturn
 
 from .atomic_checkpoint import AtomicCheckpointStore
 from .checkpoint_capture import BackendCheckpointClient, CheckpointSigner
+from .checkpoint_observer import (
+    CheckpointRestoreMilestone,
+    CheckpointRestoreObserver,
+    emit_checkpoint_restore_milestone,
+)
 from .checkpoint_restore import AtomicCheckpointRestore
 from .checkpoint_runtime import (
     CheckpointTickBlocked,
@@ -93,6 +98,7 @@ class AgentRunner:
         restore_checkpoint_on_start: bool = False,
         checkpoint_backend_client: BackendCheckpointClient | None = None,
         checkpoint_signer: CheckpointSigner | None = None,
+        checkpoint_restore_observer: CheckpointRestoreObserver | None = None,
     ) -> None:
         self._base_url = base_url
         self._name = name
@@ -114,6 +120,7 @@ class AgentRunner:
         self._restore_checkpoint_on_start = restore_checkpoint_on_start
         self._checkpoint_backend_client = checkpoint_backend_client
         self._checkpoint_signer = checkpoint_signer
+        self._checkpoint_restore_observer = checkpoint_restore_observer
         self._checkpoint_latch = RuntimeTickLatch()
         self._fail_stop_reason: str | None = None
         self._webhook_sub_id: str | None = None
@@ -437,13 +444,22 @@ class AgentRunner:
             if manifest is None:
                 raise ValueError("no active checkpoint to restore")
             intent = intent_store.begin(manifest)
+            self._observe_checkpoint_restore(
+                CheckpointRestoreMilestone.RUNTIME_INTENT_DURABLE,
+                intent,
+            )
             if intent["status"] == "activated" and not journal_replay:
                 self._checkpoint_latch.release_after_activation(intent)
+                self._observe_checkpoint_restore(
+                    CheckpointRestoreMilestone.RUNTIME_TICK_LATCH_RELEASED,
+                    intent,
+                )
                 return intent
             coordinator = AtomicCheckpointRestore(
                 store,
                 self._checkpoint_restore_client(),
                 nullcontext,
+                self._checkpoint_restore_observer,
             )
             identity = self._identity_continuity_anchor()["agent_id"]
             if not identity:
@@ -456,8 +472,16 @@ class AgentRunner:
                 memory=self._memory.local_store,
                 signer=signer,
             )
-            intent_store.complete(manifest, record)
+            intent = intent_store.complete(manifest, record)
+            self._observe_checkpoint_restore(
+                CheckpointRestoreMilestone.RUNTIME_INTENT_ACTIVATED_DURABLE,
+                intent,
+            )
             self._checkpoint_latch.release_after_activation(record)
+            self._observe_checkpoint_restore(
+                CheckpointRestoreMilestone.RUNTIME_TICK_LATCH_RELEASED,
+                record,
+            )
             logger.info(
                 "Checkpoint restore activated before ticks: %s",
                 record["checkpoint_id"],
@@ -465,6 +489,17 @@ class AgentRunner:
             return record
         except Exception as error:
             self._enter_checkpoint_fail_stop(error)
+
+    def _observe_checkpoint_restore(
+        self,
+        milestone: CheckpointRestoreMilestone,
+        record: dict[str, Any],
+    ) -> None:
+        emit_checkpoint_restore_milestone(
+            self._checkpoint_restore_observer,
+            milestone,
+            record,
+        )
 
     def _enter_checkpoint_fail_stop(self, error: Exception) -> NoReturn:
         self._fail_stop_reason = f"checkpoint_restore_incomplete:{type(error).__name__}"

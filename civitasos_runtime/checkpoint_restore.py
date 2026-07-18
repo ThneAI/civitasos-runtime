@@ -19,6 +19,11 @@ from .checkpoint_files import (
     secure_directory,
     write_private_json,
 )
+from .checkpoint_observer import (
+    CheckpointRestoreMilestone,
+    CheckpointRestoreObserver,
+    emit_checkpoint_restore_milestone,
+)
 from .memory import LocalMemory
 
 
@@ -35,10 +40,12 @@ class AtomicCheckpointRestore:
         store: AtomicCheckpointStore,
         backend: BackendCheckpointClient,
         pause_runtime: PauseFactory,
+        observer: CheckpointRestoreObserver | None = None,
     ) -> None:
         self.store = store
         self.backend = backend
         self.pause_runtime = pause_runtime
+        self.observer = observer
         self.journal_dir = self.store.root / "restore_journal"
         secure_directory(self.journal_dir)
         self.lock_path = self.store.root / "restore.lock"
@@ -105,15 +112,37 @@ class AtomicCheckpointRestore:
                     request["node_id"],
                     {"validated", "activated"},
                 )
-                self._write_journal(journal_path, manifest, "restoring", backend_record)
+                self._observe(
+                    CheckpointRestoreMilestone.BACKEND_PREFLIGHT_DURABLE,
+                    manifest,
+                    backend_record,
+                )
+                restoring = self._write_journal(
+                    journal_path, manifest, "restoring", backend_record
+                )
+                self._observe(
+                    CheckpointRestoreMilestone.RUNTIME_RESTORE_JOURNAL_DURABLE,
+                    manifest,
+                    restoring,
+                )
                 restore_runtime_snapshots(
                     memory,
                     identity_id=identity_id,
                     iem=snapshots["iem"],
                     memory_snapshot=snapshots["memory"],
                 )
-                self._write_journal(
+                self._observe(
+                    CheckpointRestoreMilestone.RUNTIME_SQLITE_COMMITTED,
+                    manifest,
+                    {"status": "runtime_applied"},
+                )
+                runtime_applied = self._write_journal(
                     journal_path, manifest, "runtime_applied", backend_record
+                )
+                self._observe(
+                    CheckpointRestoreMilestone.RUNTIME_APPLIED_JOURNAL_DURABLE,
+                    manifest,
+                    runtime_applied,
                 )
                 try:
                     activated = self.backend.restore_activate(
@@ -132,9 +161,32 @@ class AtomicCheckpointRestore:
                     request["node_id"],
                     {"activated"},
                 )
-                return self._write_journal(
+                self._observe(
+                    CheckpointRestoreMilestone.BACKEND_ACTIVATION_DURABLE,
+                    manifest,
+                    activated,
+                )
+                record = self._write_journal(
                     journal_path, manifest, "activated", activated
                 )
+                self._observe(
+                    CheckpointRestoreMilestone.RUNTIME_ACTIVATION_JOURNAL_DURABLE,
+                    manifest,
+                    record,
+                )
+                return record
+
+    def _observe(
+        self,
+        milestone: CheckpointRestoreMilestone,
+        manifest: dict[str, Any],
+        record: dict[str, Any],
+    ) -> None:
+        emit_checkpoint_restore_milestone(
+            self.observer,
+            milestone,
+            {**manifest, **record},
+        )
 
     def _backend_request(self, manifest, snapshots) -> dict[str, Any]:  # noqa: ANN001
         identity_payload = snapshots["identity"].payload

@@ -33,6 +33,11 @@ from .checkpoint_restore import (
     AtomicCheckpointRestore,
     CheckpointRestoreIncomplete,
 )
+from .checkpoint_observer import (
+    CheckpointRestoreMilestone,
+    CheckpointRestoreObserver,
+    emit_checkpoint_restore_milestone,
+)
 from .checkpoint_runtime import (
     CheckpointTickBlocked,
     RuntimeRestoreIntentStore,
@@ -91,6 +96,9 @@ __all__ = [
     "verify_signer_possession",
     "AtomicCheckpointRestore",
     "CheckpointRestoreIncomplete",
+    "CheckpointRestoreMilestone",
+    "CheckpointRestoreObserver",
+    "emit_checkpoint_restore_milestone",
     "CheckpointTickBlocked",
     "RuntimeRestoreIntentStore",
     "RuntimeTickLatch",
