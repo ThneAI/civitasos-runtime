@@ -24,6 +24,11 @@ from .checkpoint_adapters import (
     identity_snapshot,
     restore_runtime_snapshots,
 )
+from .checkpoint_capture import (
+    AtomicCheckpointCapture,
+    BackendCheckpointClient,
+    verify_signer_possession,
+)
 from .energy import Energy
 from .gateway import CallRecord, CivitasGateway, GatewayConfig, Ledger
 from .iem_anchor import build_iem_anchor, genesis_iem_state, iem_state_hash, iem_update_log_hash
@@ -72,6 +77,9 @@ __all__ = [
     "backend_projection_snapshots",
     "identity_snapshot",
     "restore_runtime_snapshots",
+    "AtomicCheckpointCapture",
+    "BackendCheckpointClient",
+    "verify_signer_possession",
     # Gateway
     "CivitasGateway",
     "GatewayConfig",

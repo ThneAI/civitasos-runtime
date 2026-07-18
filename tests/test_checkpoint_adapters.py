@@ -18,6 +18,7 @@ def _backend_projection(public_key_hex: str) -> dict:
     epoch = 7
     return {
         "schema_version": "civitasos-backend-sustainable-identity-checkpoint:v1",
+        "node_id": "node-1",
         "identity_id": IDENTITY_ID,
         "barrier_epoch": epoch,
         "identity": {

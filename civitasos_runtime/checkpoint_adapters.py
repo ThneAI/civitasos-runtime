@@ -92,6 +92,9 @@ def backend_projection_snapshots(
         raise ValueError("unsupported backend checkpoint projection schema")
     if projection.get("identity_id") != identity_id:
         raise ValueError("backend checkpoint identity binding mismatch")
+    node_id = projection.get("node_id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        raise ValueError("backend checkpoint node identity is missing")
     epoch = projection.get("barrier_epoch")
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
         raise ValueError("backend checkpoint barrier epoch is invalid")
