@@ -132,6 +132,7 @@ def backend_projection_snapshots(
 
     identity_payload = {
         **base_identity.payload,
+        "backend_node_id": node_id,
         "backend_identity": identity_component,
     }
     revision_prefix = f"backend-epoch:{epoch}"

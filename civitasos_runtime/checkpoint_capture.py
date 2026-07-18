@@ -75,13 +75,52 @@ class BackendCheckpointClient:
         if not identity_id.strip():
             raise ValueError("checkpoint identity_id is required")
         path_id = urllib.parse.quote(identity_id, safe="")
+        return self._request("GET", f"/api/v1/checkpoints/identity/{path_id}")
+
+    def restore_preflight(
+        self, identity_id: str, request_body: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not identity_id.strip():
+            raise ValueError("checkpoint identity_id is required")
+        path_id = urllib.parse.quote(identity_id, safe="")
+        return self._request(
+            "POST",
+            f"/api/v1/checkpoints/identity/{path_id}/restore/preflight",
+            request_body,
+        )
+
+    def restore_activate(
+        self, identity_id: str, checkpoint_id: str, manifest_hash: str
+    ) -> dict[str, Any]:
+        if not identity_id.strip():
+            raise ValueError("checkpoint identity_id is required")
+        path_id = urllib.parse.quote(identity_id, safe="")
+        return self._request(
+            "POST",
+            f"/api/v1/checkpoints/identity/{path_id}/restore/activate",
+            {"checkpoint_id": checkpoint_id, "manifest_hash": manifest_hash},
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.bearer_token}",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
-            f"{self.base_url.rstrip('/')}/api/v1/checkpoints/identity/{path_id}",
+            f"{self.base_url.rstrip('/')}{path}",
+            data=data,
             headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self.bearer_token}",
+                **headers,
             },
-            method="GET",
+            method=method,
         )
         return self.transport(request, self.timeout)
 
