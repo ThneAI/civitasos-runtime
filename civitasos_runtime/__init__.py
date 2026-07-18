@@ -16,6 +16,13 @@ For embedding mode (single tick):
 """
 
 from .conscience import Conscience
+from .atomic_checkpoint import AtomicCheckpointStore
+from .checkpoint_models import DomainSnapshot, REQUIRED_DOMAINS
+from .checkpoint_adapters import (
+    capture_runtime_snapshots,
+    identity_snapshot,
+    restore_runtime_snapshots,
+)
 from .energy import Energy
 from .gateway import CallRecord, CivitasGateway, GatewayConfig, Ledger
 from .iem_anchor import build_iem_anchor, genesis_iem_state, iem_state_hash, iem_update_log_hash
@@ -57,6 +64,12 @@ __version__ = "0.1.0"
 __all__ = [
     # Main entry point
     "AgentRunner",
+    "AtomicCheckpointStore",
+    "DomainSnapshot",
+    "REQUIRED_DOMAINS",
+    "capture_runtime_snapshots",
+    "identity_snapshot",
+    "restore_runtime_snapshots",
     # Gateway
     "CivitasGateway",
     "GatewayConfig",

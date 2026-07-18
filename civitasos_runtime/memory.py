@@ -79,6 +79,27 @@ class LocalMemory:
             rows = self._conn.execute("SELECT key FROM kv ORDER BY ts DESC").fetchall()
         return [r[0] for r in rows]
 
+    def snapshot(self) -> dict[str, Any]:
+        """Read one transactionally consistent copy of all local memory values."""
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM kv ORDER BY key").fetchall()
+        return {key: json.loads(value) for key, value in rows}
+
+    def restore_snapshot(self, values: dict[str, Any], *, replace: bool = True) -> None:
+        """Restore a snapshot in one SQLite transaction."""
+        encoded = {
+            str(key): json.dumps(value, ensure_ascii=False)
+            for key, value in values.items()
+        }
+        with self._lock, self._conn:
+            if replace:
+                self._conn.execute("DELETE FROM kv")
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO kv (key, value, ts) "
+                "VALUES (?, ?, julianday('now'))",
+                sorted(encoded.items()),
+            )
+
     def weighted_items(
         self,
         *,
@@ -163,6 +184,14 @@ class HybridMemory:
     ) -> list[dict[str, Any]]:
         """Return local memories ranked by lifecycle-aware time decay."""
         return self._local.weighted_items(top_k=top_k, half_life_days=half_life_days)
+
+    def local_snapshot(self) -> dict[str, Any]:
+        return self._local.snapshot()
+
+    def restore_local_snapshot(
+        self, values: dict[str, Any], *, replace: bool = True
+    ) -> None:
+        self._local.restore_snapshot(values, replace=replace)
 
     def close(self) -> None:
         self._local.close()
