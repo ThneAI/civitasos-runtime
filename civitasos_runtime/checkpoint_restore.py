@@ -43,6 +43,33 @@ class AtomicCheckpointRestore:
         secure_directory(self.journal_dir)
         self.lock_path = self.store.root / "restore.lock"
 
+    def needs_replay(self) -> bool:
+        """Return whether a durable incomplete journal blocks Runtime ticks."""
+        return self.replay_required(self.store)
+
+    @staticmethod
+    def replay_required(store: AtomicCheckpointStore) -> bool:
+        journal_dir = store.root / "restore_journal"
+        if not journal_dir.exists():
+            return False
+        secure_directory(journal_dir)
+        pending = []
+        for path in sorted(journal_dir.glob("*.json")):
+            record = read_private_json(path)
+            AtomicCheckpointRestore._validate_journal_shape(record)
+            status = record["status"]
+            if status != "activated":
+                pending.append(record)
+        if not pending:
+            return False
+        if len(pending) != 1:
+            raise ValueError("multiple incomplete Runtime restore journals")
+        manifest = store.load_latest()
+        if manifest is None:
+            raise ValueError("incomplete restore journal has no active checkpoint")
+        AtomicCheckpointRestore._validate_journal(pending[0], manifest)
+        return True
+
     def restore_latest(
         self,
         *,
@@ -143,6 +170,10 @@ class AtomicCheckpointRestore:
             or record.get("identity_id") != identity_id
             or record.get("node_id") != node_id
             or record.get("status") not in expected_statuses
+            or (
+                record.get("status") == "activated"
+                and not record.get("activation_fact_id")
+            )
         ):
             raise ValueError("backend restore journal response binding mismatch")
 
@@ -168,17 +199,34 @@ class AtomicCheckpointRestore:
 
     @staticmethod
     def _validate_journal(record: dict[str, Any], manifest: dict[str, Any]) -> None:
+        AtomicCheckpointRestore._validate_journal_shape(record)
         if (
-            record.get("schema_version")
-            != "civitasos-runtime-checkpoint-restore-journal:v1"
-            or record.get("checkpoint_id") != manifest["checkpoint_id"]
+            record.get("checkpoint_id") != manifest["checkpoint_id"]
             or record.get("manifest_hash") != manifest["manifest_hash"]
             or record.get("sequence") != manifest["sequence"]
             or record.get("identity_id") != manifest["identity_id"]
-            or record.get("status")
-            not in {"restoring", "runtime_applied", "activated"}
         ):
             raise ValueError("Runtime restore journal binding mismatch")
+
+    @staticmethod
+    def _validate_journal_shape(record: dict[str, Any]) -> None:
+        if (
+            record.get("schema_version")
+            != "civitasos-runtime-checkpoint-restore-journal:v1"
+            or record.get("status")
+            not in {"restoring", "runtime_applied", "activated"}
+            or not str(record.get("checkpoint_id", "")).startswith("aic:v1:")
+            or "/" in str(record.get("checkpoint_id", ""))
+            or (
+                record.get("status") == "activated"
+                and not isinstance(record.get("activation_fact_id"), str)
+            )
+            or (
+                record.get("status") == "activated"
+                and not record.get("activation_fact_id", "").strip()
+            )
+        ):
+            raise ValueError("Runtime restore journal is invalid")
 
     def _journal_path(self, checkpoint_id: str) -> Path:
         if not checkpoint_id.startswith("aic:v1:") or "/" in checkpoint_id:

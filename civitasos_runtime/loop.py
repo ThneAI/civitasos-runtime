@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import asdict, is_dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 from .conscience import Conscience
@@ -887,6 +887,7 @@ class CognitiveLoop:
         agent_name: str = "",
         capabilities: list[str] | None = None,
         memory: HybridMemory | None = None,
+        tick_guard: Callable[[], None] | None = None,
     ) -> None:
         self._agent = agent
         self._llm = llm
@@ -897,6 +898,7 @@ class CognitiveLoop:
         self._name = agent_name
         self._capabilities = capabilities or []
         self._memory = memory
+        self._tick_guard = tick_guard
         self._identity_emergence_enabled = _env_flag(
             "CIVITASOS_IDENTITY_EMERGENCE_ENABLED", default=False,
         )
@@ -934,6 +936,8 @@ class CognitiveLoop:
 
     async def tick(self) -> TickContext:
         """Execute one full cognitive cycle. Returns the completed TickContext."""
+        if self._tick_guard is not None:
+            self._tick_guard()
         ctx = TickContext()
         self._tick_count += 1
         logger.info(

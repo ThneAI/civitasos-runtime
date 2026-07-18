@@ -193,5 +193,10 @@ class HybridMemory:
     ) -> None:
         self._local.restore_snapshot(values, replace=replace)
 
+    @property
+    def local_store(self) -> LocalMemory:
+        """Expose the Runtime-owned store for atomic checkpoint coordination."""
+        return self._local
+
     def close(self) -> None:
         self._local.close()

@@ -11,9 +11,18 @@ import os
 import pathlib
 import signal
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
+from .atomic_checkpoint import AtomicCheckpointStore
+from .checkpoint_capture import BackendCheckpointClient, CheckpointSigner
+from .checkpoint_restore import AtomicCheckpointRestore
+from .checkpoint_runtime import (
+    CheckpointTickBlocked,
+    RuntimeRestoreIntentStore,
+    RuntimeTickLatch,
+)
 from .conscience import Conscience
 from .energy import Energy
 from .gateway import CivitasGateway, GatewayConfig
@@ -25,6 +34,28 @@ from .rules import RulesEngine, RuleFn
 from .tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+class _AgentCheckpointSigner:
+    """Adapt the SDK agent's hex-signature API to CheckpointSigner."""
+
+    def __init__(self, agent: Any) -> None:
+        self._agent = agent
+
+    @property
+    def public_key_hex(self) -> str:
+        return str(getattr(self._agent, "public_key_hex", None) or "")
+
+    def sign(self, message: bytes) -> bytes:
+        signature = self._agent.sign(message)
+        if isinstance(signature, bytes):
+            return signature
+        if isinstance(signature, str):
+            try:
+                return bytes.fromhex(signature)
+            except ValueError as error:
+                raise ValueError("SDK agent returned invalid signature hex") from error
+        raise ValueError("SDK agent returned an unsupported signature type")
 
 
 class AgentRunner:
@@ -58,6 +89,10 @@ class AgentRunner:
         identity_file: str | None = None,
         endpoint_url: str | None = None,
         data_dir: str | None = None,
+        checkpoint_root: str | None = None,
+        restore_checkpoint_on_start: bool = False,
+        checkpoint_backend_client: BackendCheckpointClient | None = None,
+        checkpoint_signer: CheckpointSigner | None = None,
     ) -> None:
         self._base_url = base_url
         self._name = name
@@ -73,6 +108,14 @@ class AgentRunner:
         self._identity_file = identity_file
         self._endpoint_url = endpoint_url
         self._data_dir = data_dir or "data"
+        self._checkpoint_root = pathlib.Path(
+            checkpoint_root or pathlib.Path(self._data_dir) / "checkpoints"
+        )
+        self._restore_checkpoint_on_start = restore_checkpoint_on_start
+        self._checkpoint_backend_client = checkpoint_backend_client
+        self._checkpoint_signer = checkpoint_signer
+        self._checkpoint_latch = RuntimeTickLatch()
+        self._fail_stop_reason: str | None = None
         self._webhook_sub_id: str | None = None
 
         # Gateway config
@@ -175,6 +218,9 @@ class AgentRunner:
             # 3. Build persistent memory (local + remote)
             self._memory = HybridMemory(self._agent, data_dir=self._data_dir)
 
+            # An incomplete restore is replayed before any gateway, heartbeat, or tick.
+            self._restore_checkpoint_before_ticks()
+
             # 4. Build tool registry
             self._tools = ToolRegistry(self._agent)
             for tool_name, fn, kwargs in self._custom_tools:
@@ -191,6 +237,7 @@ class AgentRunner:
                 agent_name=self._name,
                 capabilities=self._capabilities,
                 memory=self._memory,
+                tick_guard=self._checkpoint_latch.require_tick_allowed,
             )
 
             # Forward on_reflect if registered
@@ -272,8 +319,8 @@ class AgentRunner:
         if self._gateway:
             await self._gateway.stop()
 
-        # Attempt to release/complete active tasks before exiting
-        if self._agent:
+        # Fail-stop cleanup must not create task or memory side effects.
+        if self._agent and self._fail_stop_reason is None:
             try:
                 briefing = self._agent.briefing()
                 for task in briefing.get("active_tasks", []):
@@ -289,7 +336,7 @@ class AgentRunner:
                 logger.debug("Could not retrieve active tasks on shutdown")
 
         # Save shutdown state
-        if self._memory:
+        if self._memory and self._fail_stop_reason is None:
             try:
                 identity = self._identity_continuity_anchor()
                 self._memory.remember(
@@ -323,10 +370,15 @@ class AgentRunner:
         wake_event = asyncio.Event()
         self._loop.bind_wake_event(wake_event)
 
+        if not self._checkpoint_ticks_allowed():
+            return
+
         # Check for crash recovery
         await self._recover()
 
         while not self._shutting_down:
+            if not self._checkpoint_ticks_allowed():
+                break
             try:
                 ctx = await self._loop.tick()
                 logger.info(
@@ -359,6 +411,88 @@ class AgentRunner:
                     pass  # Normal timeout — proceed to next tick
 
         logger.info("Cognitive loop exited after %d ticks", self._loop.tick_count)
+
+    def _restore_checkpoint_before_ticks(self) -> dict[str, Any] | None:
+        if not self._checkpoint_root.exists() and not self._restore_checkpoint_on_start:
+            return None
+        try:
+            store = AtomicCheckpointStore(self._checkpoint_root)
+            manifest = store.load_latest()
+            intent_store = RuntimeRestoreIntentStore(store.root)
+            journal_replay = AtomicCheckpointRestore.replay_required(store)
+            intent_replay = intent_store.needs_replay(manifest)
+        except Exception as error:
+            self._enter_checkpoint_fail_stop(error)
+        replay_required = journal_replay or intent_replay
+        if not self._restore_checkpoint_on_start and not replay_required:
+            return None
+
+        reason = (
+            "checkpoint_restore_replay_required"
+            if replay_required
+            else "checkpoint_restore_requested"
+        )
+        self._checkpoint_latch.block(reason)
+        try:
+            if manifest is None:
+                raise ValueError("no active checkpoint to restore")
+            intent = intent_store.begin(manifest)
+            if intent["status"] == "activated" and not journal_replay:
+                self._checkpoint_latch.release_after_activation(intent)
+                return intent
+            coordinator = AtomicCheckpointRestore(
+                store,
+                self._checkpoint_restore_client(),
+                nullcontext,
+            )
+            identity = self._identity_continuity_anchor()["agent_id"]
+            if not identity:
+                raise ValueError("checkpoint restore requires a registered agent identity")
+            if self._memory is None:
+                raise ValueError("checkpoint restore requires Runtime local memory")
+            signer = self._checkpoint_signer or _AgentCheckpointSigner(self._agent)
+            record = coordinator.restore_latest(
+                identity_id=identity,
+                memory=self._memory.local_store,
+                signer=signer,
+            )
+            intent_store.complete(manifest, record)
+            self._checkpoint_latch.release_after_activation(record)
+            logger.info(
+                "Checkpoint restore activated before ticks: %s",
+                record["checkpoint_id"],
+            )
+            return record
+        except Exception as error:
+            self._enter_checkpoint_fail_stop(error)
+
+    def _enter_checkpoint_fail_stop(self, error: Exception) -> NoReturn:
+        self._fail_stop_reason = f"checkpoint_restore_incomplete:{type(error).__name__}"
+        self._checkpoint_latch.block(self._fail_stop_reason)
+        logger.critical(
+            "Checkpoint restore failed; Runtime remains fail-stopped before ticks",
+            exc_info=True,
+        )
+        raise CheckpointTickBlocked(self._fail_stop_reason) from error
+
+    def _checkpoint_restore_client(self) -> BackendCheckpointClient:
+        if self._checkpoint_backend_client is not None:
+            return self._checkpoint_backend_client
+        base_url = str(getattr(self._agent, "base_url", None) or "")
+        bearer_token = str(getattr(self._agent, "_jwt_token", None) or "")
+        if not base_url or not bearer_token:
+            raise ValueError("checkpoint restore requires an authenticated backend client")
+        return BackendCheckpointClient(base_url, bearer_token)
+
+    def _checkpoint_ticks_allowed(self) -> bool:
+        try:
+            self._checkpoint_latch.require_tick_allowed()
+            return True
+        except CheckpointTickBlocked as error:
+            self._fail_stop_reason = self._fail_stop_reason or str(error)
+            logger.critical("%s", error)
+            self.request_shutdown("checkpoint-fail-stop")
+            return False
 
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to the CivitasOS node."""
@@ -957,3 +1091,11 @@ class AgentRunner:
     @property
     def is_running(self) -> bool:
         return not self._shutting_down and self._loop is not None
+
+    @property
+    def checkpoint_latch(self) -> RuntimeTickLatch:
+        return self._checkpoint_latch
+
+    @property
+    def fail_stop_reason(self) -> str | None:
+        return self._fail_stop_reason

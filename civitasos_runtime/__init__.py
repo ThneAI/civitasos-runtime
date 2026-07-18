@@ -33,6 +33,11 @@ from .checkpoint_restore import (
     AtomicCheckpointRestore,
     CheckpointRestoreIncomplete,
 )
+from .checkpoint_runtime import (
+    CheckpointTickBlocked,
+    RuntimeRestoreIntentStore,
+    RuntimeTickLatch,
+)
 from .energy import Energy
 from .gateway import CallRecord, CivitasGateway, GatewayConfig, Ledger
 from .iem_anchor import build_iem_anchor, genesis_iem_state, iem_state_hash, iem_update_log_hash
@@ -86,6 +91,9 @@ __all__ = [
     "verify_signer_possession",
     "AtomicCheckpointRestore",
     "CheckpointRestoreIncomplete",
+    "CheckpointTickBlocked",
+    "RuntimeRestoreIntentStore",
+    "RuntimeTickLatch",
     # Gateway
     "CivitasGateway",
     "GatewayConfig",

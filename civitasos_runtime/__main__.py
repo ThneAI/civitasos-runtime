@@ -31,6 +31,10 @@ import os
 import sys
 
 
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="civitasos-runtime",
@@ -126,6 +130,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directory for persistent local memory (env: AGENT_DATA_DIR)",
     )
 
+    p.add_argument(
+        "--checkpoint-root",
+        default=os.getenv("CIVITASOS_CHECKPOINT_ROOT", ""),
+        help="Atomic identity checkpoint root (env: CIVITASOS_CHECKPOINT_ROOT)",
+    )
+    p.add_argument(
+        "--restore-checkpoint-on-start",
+        action="store_true",
+        default=_env_true("CIVITASOS_RESTORE_CHECKPOINT_ON_START"),
+        help="Restore the active checkpoint before gateway, heartbeat, or ticks",
+    )
+
     return p
 
 
@@ -172,6 +188,8 @@ def main() -> None:
         identity_file=args.identity or None,
         endpoint_url=args.endpoint or None,
         data_dir=args.data_dir,
+        checkpoint_root=args.checkpoint_root or None,
+        restore_checkpoint_on_start=args.restore_checkpoint_on_start,
     )
 
     logger = logging.getLogger("civitasos_runtime")
