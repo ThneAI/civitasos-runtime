@@ -19,6 +19,7 @@ from .conscience import Conscience
 from .atomic_checkpoint import AtomicCheckpointStore
 from .checkpoint_models import DomainSnapshot, REQUIRED_DOMAINS
 from .checkpoint_adapters import (
+    backend_projection_snapshots,
     capture_runtime_snapshots,
     identity_snapshot,
     restore_runtime_snapshots,
@@ -68,6 +69,7 @@ __all__ = [
     "DomainSnapshot",
     "REQUIRED_DOMAINS",
     "capture_runtime_snapshots",
+    "backend_projection_snapshots",
     "identity_snapshot",
     "restore_runtime_snapshots",
     # Gateway
