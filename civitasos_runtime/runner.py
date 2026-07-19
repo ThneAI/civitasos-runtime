@@ -34,7 +34,11 @@ from .gateway import CivitasGateway, GatewayConfig
 from .llm import LLMAdapter, create_llm
 from .loop import CognitiveLoop
 from .memory import HybridMemory
-from .models import ConscienceVerdict, Decision, EnergyState, TickContext
+from .mentorship import (
+    AdviceProvider,
+    BackendMentorshipAdviceProvider,
+    BackendMentorshipClient,
+)
 from .rules import RulesEngine, RuleFn
 from .tools import ToolRegistry
 
@@ -99,6 +103,7 @@ class AgentRunner:
         checkpoint_backend_client: BackendCheckpointClient | None = None,
         checkpoint_signer: CheckpointSigner | None = None,
         checkpoint_restore_observer: CheckpointRestoreObserver | None = None,
+        mentorship_provider: AdviceProvider | None = None,
     ) -> None:
         self._base_url = base_url
         self._name = name
@@ -121,6 +126,7 @@ class AgentRunner:
         self._checkpoint_backend_client = checkpoint_backend_client
         self._checkpoint_signer = checkpoint_signer
         self._checkpoint_restore_observer = checkpoint_restore_observer
+        self._mentorship_provider = mentorship_provider
         self._checkpoint_latch = RuntimeTickLatch()
         self._fail_stop_reason: str | None = None
         self._webhook_sub_id: str | None = None
@@ -245,6 +251,7 @@ class AgentRunner:
                 capabilities=self._capabilities,
                 memory=self._memory,
                 tick_guard=self._checkpoint_latch.require_tick_allowed,
+                mentorship_provider=self._runtime_mentorship_provider(),
             )
 
             # Forward on_reflect if registered
@@ -518,6 +525,28 @@ class AgentRunner:
         if not base_url or not bearer_token:
             raise ValueError("checkpoint restore requires an authenticated backend client")
         return BackendCheckpointClient(base_url, bearer_token)
+
+    def _runtime_mentorship_provider(self) -> AdviceProvider | None:
+        if self._mentorship_provider is not None:
+            return self._mentorship_provider
+        if not self._env_flag_enabled("CIVITASOS_MENTORSHIP_ENABLED"):
+            return None
+        relation_ids = tuple(
+            value.strip()
+            for value in os.getenv("CIVITASOS_MENTORSHIP_RELATION_IDS", "").split(",")
+            if value.strip()
+        )
+        base_url = str(getattr(self._agent, "base_url", None) or "")
+        bearer_token = str(getattr(self._agent, "_jwt_token", None) or "")
+        if not relation_ids or not base_url or not bearer_token:
+            logger.warning("J1 mentorship provider is not configured; continuing without advice")
+            return None
+        try:
+            client = BackendMentorshipClient(base_url, bearer_token)
+            return BackendMentorshipAdviceProvider(client, relation_ids)
+        except ValueError as error:
+            logger.warning("J1 mentorship provider rejected configuration: %s", error)
+            return None
 
     def _checkpoint_ticks_allowed(self) -> bool:
         try:

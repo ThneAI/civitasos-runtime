@@ -22,6 +22,7 @@ class DecisionSource(str, Enum):
 class TickPhase(str, Enum):
     PERCEIVE = "perceive"
     RECALL = "recall"
+    ADVICE = "advice"
     EXPECT = "expect"
     ALIGN = "align"
     DECIDE = "decide"
@@ -275,6 +276,8 @@ class TickContext:
     )
     briefing: dict[str, Any] = field(default_factory=dict)
     memories: dict[str, Any] = field(default_factory=dict)
+    mentorship_advice: dict[str, Any] = field(default_factory=dict)
+    mentorship_trace: dict[str, Any] = field(default_factory=dict)
     expectations: dict[str, Any] = field(default_factory=dict)
     surprise: dict[str, Any] = field(default_factory=dict)
     drive: dict[str, Any] = field(default_factory=dict)

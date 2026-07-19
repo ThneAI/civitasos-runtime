@@ -56,6 +56,11 @@ from .llm import (
 )
 from .loop import CognitiveLoop
 from .memory import HybridMemory, LocalMemory
+from .mentorship import (
+    AdviceProvider,
+    BackendMentorshipAdviceProvider,
+    BackendMentorshipClient,
+)
 from .models import (
     ConscienceVerdict,
     Decision,
@@ -116,6 +121,9 @@ __all__ = [
     # Memory
     "HybridMemory",
     "LocalMemory",
+    "AdviceProvider",
+    "BackendMentorshipAdviceProvider",
+    "BackendMentorshipClient",
     "build_iem_anchor",
     "genesis_iem_state",
     "iem_state_hash",
