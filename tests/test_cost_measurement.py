@@ -87,6 +87,23 @@ def test_network_measurement_records_only_counters_and_hashes() -> None:
     assert set(artifact).isdisjoint({"request", "response", "api_key"})
 
 
+def test_network_measurement_requires_boolean_dispatch_state() -> None:
+    with pytest.raises(ValueError, match="network call"):
+        network_bytes_request(
+            operation_id="cost:network:measure:1",
+            task_id="task-1",
+            actor="did:civ:broker",
+            entry_id="cost:network:call-1",
+            call_id="call-1",
+            request_bytes=1,
+            response_bytes=0,
+            connect_attempts=1,
+            request_dispatched=1,  # type: ignore[arg-type]
+            measured_at=20,
+            transport_receipt=evidence("a"),
+        )
+
+
 def test_operator_time_requires_explicit_signature_reference() -> None:
     artifact, request = operator_time_request(
         operation_id="cost:operator:measure:1",

@@ -185,7 +185,7 @@ def network_bytes_request(
     counters = (request_bytes, response_bytes, connect_attempts, measured_at)
     if any(type(value) is not int or value < 0 for value in counters):
         raise ValueError("network counters are invalid")
-    if not call_id or connect_attempts < 1:
+    if type(request_dispatched) is not bool or not call_id or connect_attempts < 1:
         raise ValueError("network call identity or connect attempts are invalid")
     content = {
         "schema_version": NETWORK_MEASUREMENT_SCHEMA,
