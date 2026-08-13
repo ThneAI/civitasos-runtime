@@ -44,6 +44,20 @@ from .checkpoint_runtime import (
     RuntimeTickLatch,
 )
 from .energy import Energy
+from .cost_measurement import (
+    EvidenceReference,
+    StorageEntry,
+    StorageSnapshot,
+    collect_storage_snapshot,
+    network_bytes_request,
+    operator_time_request,
+    rate_publication_request,
+    reconciliation_request,
+    reservation_request,
+    storage_byte_seconds_request,
+    unknown_cost_request,
+    waived_cost_request,
+)
 from .gateway import CallRecord, CivitasGateway, GatewayConfig, Ledger
 from .iem_anchor import build_iem_anchor, genesis_iem_state, iem_state_hash, iem_update_log_hash
 from .identity_expectation import apply_identity_expectation_traces, apply_iem_updates_to_state
@@ -107,6 +121,19 @@ __all__ = [
     "CheckpointTickBlocked",
     "RuntimeRestoreIntentStore",
     "RuntimeTickLatch",
+    # Cost measurement and Fact request construction
+    "EvidenceReference",
+    "StorageEntry",
+    "StorageSnapshot",
+    "collect_storage_snapshot",
+    "storage_byte_seconds_request",
+    "network_bytes_request",
+    "operator_time_request",
+    "rate_publication_request",
+    "reservation_request",
+    "reconciliation_request",
+    "unknown_cost_request",
+    "waived_cost_request",
     # Gateway
     "CivitasGateway",
     "GatewayConfig",

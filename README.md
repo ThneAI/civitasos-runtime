@@ -100,6 +100,13 @@ print(ctx.decision, ctx.evaluation, ctx.reflection)
 | `rules.py` | ~100 | Deterministic pre-LLM decision rules |
 | `loop.py` | ~280 | 7-phase cognitive loop |
 | `runner.py` | ~200 | Lifecycle: init → register → loop → shutdown |
+| `cost_measurement.py` | — | Content-minimized storage/network/operator cost Evidence and Backend cost Fact requests |
+
+`cost_measurement.py` records allocated byte-seconds for immutable storage,
+application-payload byte counters for broker calls, and externally signed
+operator active seconds. It emits typed `civitasos-cost-fact:v1` requests but
+does not publish rates or append Facts by itself. Raw paths, file contents,
+request/response bodies, credentials, and hidden reasoning are excluded.
 
 ## Install
 
